@@ -18,6 +18,8 @@ const M24: u32 = 0xFF_FFFF;
 #[cfg(feature = "gpu")]
 const GPU_WARP: (&str, &str) = ("warp", concat!(include_str!("gpu_sample.wgsl"), "\n", include_str!("gpu_warp.wgsl")));
 #[cfg(feature = "gpu")]
+const GPU_DISTANCE: (&str, &str) = ("distance", concat!(include_str!("gpu_sample.wgsl"), "\n", include_str!("gpu_distance.wgsl")));
+#[cfg(feature = "gpu")]
 const GPU_BLUR: (&str, &str) = ("blur", concat!(include_str!("gpu_sample.wgsl"), "\n", include_str!("gpu_blur.wgsl")));
 #[cfg(feature = "gpu")]
 const GPU_MBLUR: (&str, &str) = ("motionblur", concat!(include_str!("gpu_sample.wgsl"), "\n", include_str!("gpu_mblur.wgsl")));
@@ -836,6 +838,116 @@ impl<'p> Runtime<'p> {
         true
     }
 
+    /// The distance node (op 0x2A) on the GPU (gpu_distance.wgsl), mirroring "distance" in its
+    /// 14.1 mode (SDRT_DISTQ / SDRT_DIST14 unset): jump flooding, one GPU pass per step
+    /// (max(w, h) / 2 down to 1) in the CPU's candidate order and with its strict-improvement tie
+    /// rule, then a shading pass (the Euclidean root is correctly rounded, the falloff fused as
+    /// the CPU's). The mask and source are input_at: an image.rs "resized" pass first when their
+    /// size differs. The constants (1/pixelsize, distance / 256 and its reciprocal) are computed
+    /// here as the CPU does. CPU fallbacks: a missing input, the SDRT_DIST* / resize switches,
+    /// images over one storage binding, sides over 16384 texels, and (after the parameters were
+    /// evaluated: the node variables are restored) a pixel size or maximum distance whose
+    /// reciprocal is non-finite or outside the range the shader reproduces exactly.
+    #[cfg(feature = "gpu")]
+    fn try_gpu_distance(&mut self, n: &Node) -> bool {
+        use crate::gpu::Src;
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU distance node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let Some(&km) = n.inputs.first() else { return early("missing input") };
+        const SWITCHES: [&str; 6] = ["SDRT_DISTQ", "SDRT_DIST14", "SDRT_DISTDBG", "SDRT_RESIZE", "SDRT_RESIZEMIP", "SDRT_BIL256"];
+        if SWITCHES.iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let ks = n.inputs.get(1).copied();
+        let Some(mi) = self.gpu_image_info(km) else { return early("missing input") };
+        let si = match ks {
+            Some(k) => match self.gpu_image_info(k) {
+                Some(i) => Some(i),
+                None => return early("missing input"),
+            },
+            None => None,
+        };
+        let (w, h) = n.size();
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(w, h) || !g.fits(mi.0, mi.1) || si.is_some_and(|i| !g.fits(i.0, i.1)) {
+            return early("image exceeds one GPU storage binding");
+        }
+        if [w, h, mi.0, mi.1, si.map_or(0, |i| i.0), si.map_or(0, |i| i.1)].iter().any(|&s| s > 16384) {
+            return early("side over 16384 texels");
+        }
+        // Evaluate the seed and the parameters exactly as exec() and "distance" do (the
+        // "distance" function is evaluated twice there, with the pixel size and the mode between).
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let _dist = self.param(n, "distance", seed).map_or(10.0, |v| v[0]) * w as f32 / 256.0;
+        let ps = self.pixelsize(n, seed);
+        let mode = self.param(n, "mode", seed).map_or((n.flags >> 4) & 3, |v| v[0] as u32);
+        let dmax = self.param(n, "distance", seed).map_or(10.0, |v| v[0]) / 256.0;
+        let inv = 1.0f32 / dmax;
+        let (ix, iy) = (1.0f32 / ps.0, 1.0f32 / ps.1);
+        let scale_ok = |v: f32| v.is_finite() && (1e-6..=1e6).contains(&v.abs());
+        if !(scale_ok(ix) && scale_ok(iy)) {
+            self.node_vars = saved_vars;
+            return early("pixel size outside the exact range");
+        }
+        if !(dmax.is_finite() && dmax >= 1e-20 && inv.is_finite() && inv < 1e20) {
+            self.node_vars = saved_vars;
+            return early("maximum distance outside the exact range");
+        }
+        let mut passes = Vec::new();
+        // the mask and the source at the node's size (resized: unquantized, own colour flag)
+        let at_size = |passes: &mut Vec<crate::gpu::Pass>, k: usize, i: (usize, usize, bool)| {
+            if (i.0, i.1) == (w, h) {
+                Src::Node(k)
+            } else {
+                passes.push(Self::filter_pass(2, 0, [i.0 as u32, i.1 as u32, 3, u32::from(i.2)], (w, h), i.2, 3, Src::Node(k), Src::None));
+                Src::Pass(passes.len() - 1)
+            }
+        };
+        let mask = at_size(&mut passes, km, mi);
+        let src = match (ks, si) {
+            (Some(k), Some(i)) => Some(at_size(&mut passes, k, i)),
+            _ => None,
+        };
+        let mut flags = (n.b3 & 3) | u32::from(mi.2) << 3 | mode.min(2) << 4;
+        let mut cur = mask;
+        let mut first = true;
+        let mut step = w.max(h) / 2;
+        let mut floods = 0;
+        while step > 0 {
+            let mut p = Self::filter_pass(0, flags | if first { 4 } else { 0 }, [0; 4], (w, h), true, 3, cur, Src::None);
+            p.config[12..14].copy_from_slice(&[step as u32, w.max(h) as u32]);
+            p.config[4..8].copy_from_slice(&[ix, iy, dmax, inv].map(f32::to_bits));
+            passes.push(p);
+            cur = Src::Pass(passes.len() - 1);
+            first = false;
+            step /= 2;
+            floods += 1;
+        }
+        if src.is_some() {
+            flags |= 64 | (n.flags & 2) << 6;
+        }
+        flags |= u32::from(n.color) << 9;
+        let mut p = Self::filter_pass(1, flags | if first { 4 } else { 0 }, [0; 4], (w, h), n.color, n.format(), cur, src.unwrap_or(Src::None));
+        p.config[4..8].copy_from_slice(&[ix, iy, dmax, inv].map(f32::to_bits));
+        passes.push(p);
+        let inputs: Vec<usize> = std::iter::once(km).chain(ks).collect();
+        self.gpu_filter_dispatch(n, GPU_DISTANCE, &inputs, None, &passes);
+        if log {
+            eprintln!(
+                "GPU distance node {}: shader {} passes ({floods} flood), {w}x{h}, mask {}x{} source {:?}, metric {}, tiling {}, dmax {dmax} 1/ps ({ix}, {iy})",
+                n.index, passes.len(), mi.0, mi.1, si.map(|i| (i.0, i.1)), mode.min(2), n.b3 & 3
+            );
+        }
+        true
+    }
+
     /// The blur node (op 0x14) on the GPU (gpu_blur.wgsl), mirroring "blur": the taps of
     /// "blur_taps" / "blur_fetches" (per output parity) are computed here and bound as a table.
     /// - a larger input (both sides >= the node's, not equal): a horizontal pass of "bilinear_or"
@@ -1498,6 +1610,7 @@ impl<'p> Runtime<'p> {
         if n.op == 0x0E { return self.try_gpu_warp(n); }
         if n.op == 0x18 { return self.try_gpu_dirwarp(n); }
         if n.op == 0x14 { return self.try_gpu_blur(n); }
+        if n.op == 0x2A { return self.try_gpu_distance(n); }
         if n.op == 0x16 { return self.try_gpu_motion_blur(n); }
         // the colour kernels log their own fallback reasons too
         if n.op == 0x00 { return self.try_gpu_gradient_map(n); }
