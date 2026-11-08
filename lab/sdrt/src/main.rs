@@ -366,6 +366,10 @@ fn report(rt: &ops::Runtime) {
             eprintln!("time: op {op:#04x} {t:.2}s");
         }
     }
+    if !rt.gpu_ops.is_empty() && std::env::var("SDRT_GPU_LOG").is_ok() {
+        let row: Vec<String> = rt.gpu_ops.iter().map(|(op, (g, c))| format!("{op:#04x} {g}/{}", g + c)).collect();
+        eprintln!("GPU coverage (op gpu/all): {}", row.join(", "));
+    }
     let mut kinds: std::collections::BTreeMap<&str, usize> = Default::default();
     for (_, why) in &rt.unsupported {
         *kinds.entry(why.as_str()).or_default() += 1;

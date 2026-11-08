@@ -9,21 +9,39 @@ struct Resident {
     color: bool,
 }
 
-/// One pass of the transformation kernel: its Config words (`header.x` selects sample /
-/// permute / halve / upsample, see gpu_xf.wgsl), output size, colour flag and storage format.
-pub struct XfPass {
+/// Where a pass reads `input_a` / `input_b` (bindings 1 and 2) from.
+#[derive(Clone, Copy, Debug)]
+pub enum Src {
+    /// a one-texel dummy buffer
+    None,
+    /// a resident graph image
+    Node(usize),
+    /// the output of an earlier pass of the same chain
+    Pass(usize),
+}
+
+/// One pass of a kernel chain (see `Gpu::dispatch_passes`): its Config words, output size,
+/// colour flag and storage format (the prelude's `store` quantizes to them), and its inputs.
+pub struct Pass {
     pub config: [u32; 40],
     pub w: usize,
     pub h: usize,
     pub color: bool,
     pub format: u32,
+    pub a: Src,
+    pub b: Src,
 }
+
+/// The transformation kernel (gpu_xf.wgsl): `header.x` selects sample / permute / halve /
+/// upsample.
+pub const XF: (&str, &str) = ("transformation", include_str!("gpu_xf.wgsl"));
 
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
-    xf_pipeline: wgpu::ComputePipeline,
+    /// prelude + one WGSL file each, compiled on first use (see `dispatch_passes`)
+    kernels: HashMap<&'static str, wgpu::ComputePipeline>,
     layout: wgpu::PipelineLayout,
     pp: HashMap<String, wgpu::ComputePipeline>,
     pub dispatched: usize,
@@ -81,25 +99,11 @@ impl Gpu {
             module: &module,
             entry_point: "main",
         });
-        // The transformation kernel shares the prelude (config, quantize, store) and the
-        // same bind group layout, but samples its source instead of combining two inputs.
-        let xf_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sdrt transformation"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", include_str!("gpu_prelude.wgsl"), include_str!("gpu_xf.wgsl")).into(),
-            ),
-        });
-        let xf_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("sdrt transformation"),
-            layout: Some(&layout),
-            module: &xf_module,
-            entry_point: "main",
-        });
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
             return Err(error.to_string());
         }
         eprintln!("GPU: {} ({:?}, {}); initial hybrid backend", info.name, info.backend, info.driver);
-        Ok(Self { device, queue, pipeline, xf_pipeline, layout, pp: HashMap::new(), dispatched: 0, downloads: 0, uploads: 0, input_copies: 0, images: HashMap::new() })
+        Ok(Self { device, queue, pipeline, kernels: HashMap::new(), layout, pp: HashMap::new(), dispatched: 0, downloads: 0, uploads: 0, input_copies: 0, images: HashMap::new() })
     }
 
     pub fn size(&self, id: usize) -> Option<(usize, usize)> {
@@ -251,19 +255,38 @@ impl Gpu {
         self.images.get(&id).map(|i| i.color)
     }
 
-    /// The transformation kernel (op 0x04, gpu_xf.wgsl): a chain of passes recorded in one
-    /// submission. The first pass reads the resident `source`, each later pass the previous
-    /// pass's output; the last output becomes resident image `id`. Intermediate buffers
-    /// (mip levels, per-axis halvings and 2x upsamples) are not graph nodes and are freed
-    /// once the GPU is done with them. Each pass's `selectors` must describe its input.
-    pub fn dispatch_transform(&mut self, id: usize, source: usize, passes: &[XfPass]) -> Result<(), String> {
-        let src = self.images.get(&source).ok_or("transform source is not resident on the GPU")?;
-        let (mut input, mut iw, mut ih) = (src.buffer.clone(), src.w, src.h);
-        let last = passes.last().ok_or("transform without passes")?;
+    /// A chain of passes of one kernel (`(name, WGSL)`, appended to the prelude and compiled
+    /// on first use), recorded in one submission. Each pass reads graph images or earlier
+    /// passes' outputs; the last output becomes resident image `id`. Intermediate buffers are
+    /// not graph nodes and are freed once the GPU is done with them.
+    pub fn dispatch_passes(&mut self, id: usize, kernel: (&'static str, &'static str), passes: &[Pass]) -> Result<(), String> {
+        let last = passes.last().ok_or("kernel chain without passes")?;
+        if !self.kernels.contains_key(kernel.0) {
+            self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(kernel.0),
+                source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("gpu_prelude.wgsl"), kernel.1).into()),
+            });
+            let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(kernel.0),
+                layout: Some(&self.layout),
+                module: &module,
+                entry_point: "main",
+            });
+            if let Some(e) = pollster::block_on(self.device.pop_error_scope()) {
+                return Err(format!("{} kernel: {e}", kernel.0));
+            }
+            self.kernels.insert(kernel.0, pipeline);
+        }
         let limits = self.device.limits();
-        let layout = self.xf_pipeline.get_bind_group_layout(0);
+        let dummy = Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("unused input"),
+            contents: bytemuck::cast_slice(&[[0f32; 4]]),
+            usage: wgpu::BufferUsages::STORAGE,
+        }));
+        let mut outputs: Vec<Arc<wgpu::Buffer>> = Vec::with_capacity(passes.len());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        for pass in passes {
+        for (i, pass) in passes.iter().enumerate() {
             let (w, h) = (pass.w, pass.h);
             let count = w.checked_mul(h).ok_or("GPU image size overflow")?;
             let bytes = (count as u64).checked_mul(16).ok_or("GPU buffer size overflow")?;
@@ -275,44 +298,51 @@ impl Gpu {
             {
                 return Err(format!("GPU buffer limits exceeded for {w}x{h}; no silent CPU fallback"));
             }
-            if (iw as u32, ih as u32) != (pass.config[12], pass.config[13]) {
-                return Err(format!("transform pass input descriptor {}x{} does not match its {iw}x{ih} input", pass.config[12], pass.config[13]));
-            }
+            let source = |s: Src| -> Result<Arc<wgpu::Buffer>, String> {
+                match s {
+                    Src::None => Ok(dummy.clone()),
+                    Src::Node(k) => self.images.get(&k).map(|r| r.buffer.clone()).ok_or_else(|| format!("{} pass {i}: node {k} is not resident", kernel.0)),
+                    Src::Pass(j) if j < i => Ok(outputs[j].clone()),
+                    Src::Pass(j) => Err(format!("{} pass {i} reads pass {j}", kernel.0)),
+                }
+            };
+            let (a, b) = (source(pass.a)?, source(pass.b)?);
             let mut config = pass.config;
             config[1] = count as u32;
             config[2] = w as u32;
             config[16] = pass.format;
             config[17] = u32::from(pass.color);
             let params = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("transform params"),
+                label: Some("pass params"),
                 contents: bytemuck::cast_slice(&config),
                 usage: wgpu::BufferUsages::STORAGE,
             });
             let out = Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("transform output"),
+                label: Some("pass output"),
                 size: bytes,
                 mapped_at_creation: false,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             }));
-            // Binding 2 is unused by the kernel; the input is bound there too (both read-only).
-            let entries: Vec<_> = [&params, input.as_ref(), input.as_ref(), out.as_ref()]
+            let pipeline = &self.kernels[kernel.0];
+            let layout = pipeline.get_bind_group_layout(0);
+            let entries: Vec<_> = [&params, a.as_ref(), b.as_ref(), out.as_ref()]
                 .iter()
                 .enumerate()
                 .map(|(i, b)| wgpu::BindGroupEntry { binding: i as u32, resource: b.as_entire_binding() })
                 .collect();
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("transform inputs"), layout: &layout, entries: &entries });
-            // One compute pass per step: wgpu orders the write before the next pass's read.
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("pass inputs"), layout: &layout, entries: &entries });
+            // One compute pass per step: wgpu orders each write before the next pass's read.
             {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("transform"), timestamp_writes: None });
-                cpass.set_pipeline(&self.xf_pipeline);
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(kernel.0), timestamp_writes: None });
+                cpass.set_pipeline(pipeline);
                 cpass.set_bind_group(0, &bind, &[]);
                 cpass.dispatch_workgroups(groups[0], groups[1], 1);
             }
-            (input, iw, ih) = (out, w, h);
+            outputs.push(out);
             self.dispatched += 1;
         }
         self.queue.submit(Some(encoder.finish()));
-        self.images.insert(id, Resident { buffer: input, w: last.w, h: last.h, color: last.color });
+        self.images.insert(id, Resident { buffer: outputs.pop().unwrap(), w: last.w, h: last.h, color: last.color });
         self.device.poll(wgpu::Maintain::Poll);
         Ok(())
     }

@@ -33,6 +33,8 @@ pub struct Runtime<'p> {
     pub cur_size: [f32; 2],
     /// Seconds spent per opword byte0.
     pub op_time: std::collections::BTreeMap<u32, f64>,
+    /// With the Vulkan backend: nodes per opcode that ran on the GPU / on the CPU.
+    pub gpu_ops: std::collections::BTreeMap<u32, (usize, usize)>,
     mip_cache: HashMap<(usize, u32), std::sync::Arc<Vec<Image>>>,
     /// log2 size of every node as run (static, or from its size function).
     pub sizes: Vec<(u32, u32)>,
@@ -215,6 +217,7 @@ impl<'p> Runtime<'p> {
             unsupported: vec![],
             cur_size: [256.0, 256.0],
             op_time: Default::default(),
+            gpu_ops: Default::default(),
             mip_cache: HashMap::new(),
             sizes: p.nodes.iter().map(|n| n.log2).collect(),
             node_vars: Vec::new(),
@@ -391,6 +394,11 @@ impl<'p> Runtime<'p> {
             let t0 = std::time::Instant::now();
             #[cfg(feature="gpu")]
             let resident=self.try_gpu(&node);
+            #[cfg(feature="gpu")]
+            if self.gpu.is_some() {
+                let e=self.gpu_ops.entry(node.op).or_default();
+                if resident {e.0+=1} else {e.1+=1}
+            }
             #[cfg(not(feature="gpu"))]
             let resident=false;
             if !resident {
@@ -452,7 +460,7 @@ impl<'p> Runtime<'p> {
     /// functions from the same state.
     #[cfg(feature = "gpu")]
     fn try_gpu_transform(&mut self, n: &Node) -> bool {
-        use crate::gpu::XfPass;
+        use crate::gpu::{Pass, Src};
         let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
         let early = |why: &str| {
             if log {
@@ -515,7 +523,7 @@ impl<'p> Runtime<'p> {
             let matte_c = if n.color { [matte[0], matte[1], matte[2], matte[3]] } else { Image::gray(matte[0]) };
             config[8..12].copy_from_slice(&matte_c.map(f32::to_bits));
             config[12..16].copy_from_slice(&[input.0 as u32, input.1 as u32, in_fmt, u32::from(src_color)]);
-            XfPass { config, w: out.0, h: out.1, color, format }
+            Pass { config, w: out.0, h: out.1, color, format, a: Src::None, b: Src::None }
         };
         let axes = |x: bool, y: bool| u32::from(x) << 8 | u32::from(y) << 9;
         let wrap_bits = u32::from(wrap.0) | u32::from(wrap.1) << 1;
@@ -608,7 +616,12 @@ impl<'p> Runtime<'p> {
         if g.size(k).is_none() {
             g.upload(k, self.images[k].as_ref().expect("transform input computed")).expect("transform upload failed");
         }
-        g.dispatch_transform(n.index, k, &passes).expect("Vulkan transform dispatch failed");
+        // each pass reads the previous one; the first reads the source node
+        for (i, p) in passes.iter_mut().enumerate() {
+            p.a = if i == 0 { Src::Node(k) } else { Src::Pass(i - 1) };
+            p.b = p.a;
+        }
+        g.dispatch_passes(n.index, crate::gpu::XF, &passes).expect("Vulkan transform dispatch failed");
         if log {
             let last = passes.last().unwrap();
             eprintln!(
