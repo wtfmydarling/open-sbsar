@@ -1,0 +1,28 @@
+# open-sbsar is published from this research folder. Everything is ignored unless it is listed
+# below: research notes, helper-agent folders, scratch data, renders and every test corpus stay
+# local. The corpora contain third-party files (Adobe Substance 3D Assets, application files)
+# that must never be committed. Add new public paths here explicitly.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE*
+!/NOTICE
+!/docs/
+
+# the engine (Rust crate), without build output
+!/lab/
+/lab/*
+!/lab/sdrt/
+/lab/sdrt/target/
+
+# the .sbsar writer (Python 3, standard library only)
+!/tools/
+/tools/*
+!/tools/write.py
+
+# never: build output, Python caches, editor files
+target/
+__pycache__/
+*.pyc
+.vscode/
+.idea/

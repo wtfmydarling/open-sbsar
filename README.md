@@ -1,0 +1,57 @@
+# open-sbsar
+
+An open, clean-room implementation of the runtime behind compiled Substance archives
+(`.sbsar`): a reader and renderer for the compiled programs inside them (`.sbsasm`), a
+bit-level specification of the format, and a writer that produces `.sbsar` files.
+
+Status: research software, under active development. Not affiliated with, endorsed by or
+derived from code of Adobe. "Substance" is a trademark of its owner; it is used here only to
+name the file format this project interoperates with.
+
+## How it was made
+
+Black-box only. We wrote `.sbsar` files ourselves, rendered them with the official command-line
+renderer and compared the images pixel by pixel with our engine, then refined the formulas until
+they matched. No decompilation, disassembly, shader or API capture, and no reading of the vendor's
+binaries or resources was used at any point.
+
+## What is here
+
+| Path | What |
+| --- | --- |
+| `lab/sdrt/` | `sdrt`, the engine (Rust): container and program parser, node operations, the function VM, FX-Maps, text, bitmaps; CPU reference path and an optional Vulkan (wgpu) backend |
+| `lab/sdrt/GPU.md` | state of the Vulkan backend: what runs on the GPU, how bit-exactness with the CPU path is kept, limits |
+| `tools/write.py` | writes `.sbsar` files from scratch (Python 3, standard library; needs `7z`) |
+| `docs/` | the format specification (in progress) |
+
+## Accuracy
+
+Measured against Substance's own renderer (version 14.1, its Vulkan engine) at 128² on 227
+real-world material files (not part of this repository): 281,402 of 324,070 image nodes (86.8%)
+identical, and of 1,575 outputs
+1,135 within 1/255, 156 within 0.02, 284 further off. Most of the remaining differences are
+floating-point noise that Substance's own CPU and GPU engines also disagree on, amplified by
+noise/threshold chains; matching its GPU engine exactly is the purpose of the Vulkan backend.
+
+## Build and run
+
+```sh
+cargo build --release --manifest-path lab/sdrt/Cargo.toml                  # CPU only
+cargo build --release --features gpu --manifest-path lab/sdrt/Cargo.toml   # + Vulkan backend
+```
+
+`7z` must be on `PATH` (archives are read with it).
+
+```sh
+sdrt render FILE.sbsar OUTDIR            # every output as a 16-bit PNG named after its identifier
+sdrt node FILE.sbsar INDEX OUT.png       # one node's image (OUT.f32: raw RGBA f32, every bit)
+sdrt nodes FILE.sbsar OUTDIR K...        # several nodes from one run
+sdrt inputs FILE.sbsar                   # the graph's parameters
+sdrt stats FILE.sbsar                    # every node: op, size, value ranges
+    --set '$outputsize=9,9'              # set a parameter (log2 sizes here: 512²)
+    --backend vulkan                     # hybrid GPU execution (build with --features gpu)
+```
+
+## License
+
+To be decided by the project owner before the first public release.

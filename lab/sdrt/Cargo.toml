@@ -1,0 +1,39 @@
+# sdrt: a CPU reference runtime for compiled Substance programs (.sbsasm), written from
+# research/sbsar/NOTES.md. Research only; research/ is gitignored.
+[package]
+name = "sdrt"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
+rayon = "1.12"
+
+[profile.release]
+debug = 1
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# research probe (lab/sdrt/src/bin/gpu_fma.rs): only with the Vulkan backend
+[[bin]]
+name = "gpu_fma"
+path = "src/bin/gpu_fma.rs"
+required-features = ["gpu"]
+
+[dependencies.wgpu]
+version = "0.19.4"
+optional = true
+features = ["wgsl"]
+
+[dependencies.pollster]
+version = "0.3"
+optional = true
+
+[dependencies.bytemuck]
+version = "1"
+optional = true
