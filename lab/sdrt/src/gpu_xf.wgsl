@@ -34,9 +34,12 @@ fn round_away(v: f32) -> f32 {
     return -floor(-v + 0.5);
 }
 
-// Floor division wrap of a texel index into [0, n).
+// i.rem_euclid(n) for n > 0. Never `%` on a negative i32: on wgpu 0.19 / NVIDIA 615 it gives the
+// unsigned remainder of the bit pattern (-5 % 3 == 2), right only for powers of two.
 fn wrap_index(i: i32, n: i32) -> i32 {
-    return ((i % n) + n) % n;
+    if i >= 0 { return i % n; }
+    // -(i + 1) >= 0 for every i < 0 (no overflow at i32::MIN)
+    return n - 1 - i32(u32(-(i + 1)) % u32(n));
 }
 
 fn is_nan(v: f32) -> bool {

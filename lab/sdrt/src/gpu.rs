@@ -142,10 +142,10 @@ impl Gpu {
         config: &[u32; 40],
         a: Option<usize>,
         b: Option<usize>,
-        shader: Option<&str>,
+        shader: Option<(&str, &[u32])>,
         pp_inputs: &[(Option<usize>,u32)],
     ) -> Result<(), String> {
-        if let Some(source) = shader {
+        if let Some((source, _)) = shader {
             if !self.pp.contains_key(source) {
                 let start = std::time::Instant::now();
                 self.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -166,7 +166,7 @@ impl Gpu {
                 self.pp.insert(source.into(), pipeline);
             }
         }
-        let pipeline = shader.map_or(&self.pipeline, |s| &self.pp[s]);
+        let pipeline = shader.map_or(&self.pipeline, |(s, _)| &self.pp[s]);
         let count = w.checked_mul(h).ok_or("GPU image size overflow")?;
         let bytes = (count as u64).checked_mul(16).ok_or("GPU buffer size overflow")?;
         let groups = [(w as u32).div_ceil(8), (h as u32).div_ceil(8)];
@@ -188,7 +188,15 @@ impl Gpu {
         config[17] = u32::from(color);
         config[18]=u32::from(pp_inputs.len()>2);
         config[19]=pp_inputs.len() as u32;
-        let params = upload("params", bytemuck::cast_slice(&config));
+        // A PP shader's per-node values follow the 40 Config words (its `config.lits`): one
+        // word at least, padded to the struct's 16-byte alignment (the binding size the
+        // shader expects).
+        let mut words = config.to_vec();
+        if let Some((_, lits)) = shader {
+            words.extend_from_slice(lits);
+            words.resize((words.len() + 1).next_multiple_of(4), 0);
+        }
+        let params = upload("params", bytemuck::cast_slice(&words));
         let zero = [[0f32; 4]];
         let dummy = Arc::new(upload("unused input", bytemuck::cast_slice(&zero)));
         let mut ba = a.map_or_else(|| dummy.clone(), |id| self.images[&id].buffer.clone());

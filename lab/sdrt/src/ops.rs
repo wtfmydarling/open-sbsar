@@ -13,6 +13,31 @@ pub const QUAD_A: u32 = 3626811;
 pub const QUAD_C: u32 = 51137;
 const M24: u32 = 0xFF_FFFF;
 
+/// Filter kernels (`Gpu::dispatch_passes` prepends the prelude): the shared sampling helpers of
+/// gpu_sample.wgsl, then the kernel.
+#[cfg(feature = "gpu")]
+const GPU_WARP: (&str, &str) = ("warp", concat!(include_str!("gpu_sample.wgsl"), "\n", include_str!("gpu_warp.wgsl")));
+#[cfg(feature = "gpu")]
+const GPU_BLUR: (&str, &str) = ("blur", concat!(include_str!("gpu_sample.wgsl"), "\n", include_str!("gpu_blur.wgsl")));
+#[cfg(feature = "gpu")]
+const GPU_MBLUR: (&str, &str) = ("motionblur", concat!(include_str!("gpu_sample.wgsl"), "\n", include_str!("gpu_mblur.wgsl")));
+/// The resident id of a node-constant table built on the CPU (filter taps and offsets, gradient
+/// map and curve tables), bound for one dispatch and released after it: no graph node has it.
+#[cfg(feature = "gpu")]
+const GPU_TABLE: usize = usize::MAX;
+
+
+/// The colour kernels: the prelude (added by gpu.rs), gpu_color_common.wgsl, then each one's file.
+#[cfg(feature = "gpu")]
+const GPU_GRADIENT: (&str, &str) = ("gradient map", concat!(include_str!("gpu_color_common.wgsl"), include_str!("gpu_gradient.wgsl")));
+#[cfg(feature = "gpu")]
+const GPU_HSL: (&str, &str) = ("hsl", concat!(include_str!("gpu_color_common.wgsl"), include_str!("gpu_hsl.wgsl")));
+#[cfg(feature = "gpu")]
+const GPU_EMBOSS: (&str, &str) = ("emboss", concat!(include_str!("gpu_color_common.wgsl"), include_str!("gpu_emboss.wgsl")));
+#[cfg(feature = "gpu")]
+const GPU_DYNGRAD: (&str, &str) = ("dynamic gradient", concat!(include_str!("gpu_color_common.wgsl"), include_str!("gpu_dyngrad.wgsl")));
+#[cfg(feature = "gpu")]
+const GPU_CURVE: (&str, &str) = ("curve", concat!(include_str!("gpu_color_common.wgsl"), include_str!("gpu_curve.wgsl")));
 pub struct Runtime<'p> {
     pub p: &'p Program,
     #[cfg(feature = "gpu")]
@@ -633,6 +658,741 @@ impl<'p> Runtime<'p> {
         true
     }
 
+    /// Width, height and colour flag of node k's image, resident on the GPU or on the CPU.
+    #[cfg(feature = "gpu")]
+    fn gpu_image_info(&self, k: usize) -> Option<(usize, usize, bool)> {
+        if k >= self.p.nodes.len() {
+            return None;
+        }
+        let g = self.gpu.as_ref()?;
+        if let (Some((w, h)), Some(c)) = (g.size(k), g.color(k)) {
+            return Some((w, h, c));
+        }
+        self.images.get(k)?.as_ref().map(|im| (im.w, im.h, im.color))
+    }
+
+    /// Dispatch a filter kernel chain for node n: its image inputs are uploaded when the CPU
+    /// computed them, and `table` (node constants: taps, offsets) is bound as `Src::Node(GPU_TABLE)`
+    /// for the duration of the submission.
+    #[cfg(feature = "gpu")]
+    fn gpu_filter_dispatch(&mut self, n: &Node, kernel: (&'static str, &'static str), inputs: &[usize], table: Option<Vec<[f32; 4]>>, passes: &[crate::gpu::Pass]) {
+        let g = self.gpu.as_mut().unwrap();
+        for &k in inputs {
+            if g.size(k).is_none() {
+                g.upload(k, self.images[k].as_ref().expect("filter input computed")).expect("filter upload failed");
+            }
+        }
+        if let Some(px) = table {
+            g.release(GPU_TABLE);
+            g.upload(GPU_TABLE, &Image { w: px.len(), h: 1, color: true, px }).expect("filter table upload failed");
+        }
+        g.dispatch_passes(n.index, kernel, passes).unwrap_or_else(|e| panic!("Vulkan {} dispatch failed: {e}", kernel.0));
+        // wgpu keeps the buffer alive until the submission that reads it is done
+        g.release(GPU_TABLE);
+        self.images[n.index] = None;
+    }
+
+    /// A filter pass reading `a` (descriptor `desc`: width, height, sampled format, colour) and `b`.
+    #[cfg(feature = "gpu")]
+    fn filter_pass(op: u32, flags: u32, desc: [u32; 4], out: (usize, usize), color: bool, format: u32, a: crate::gpu::Src, b: crate::gpu::Src) -> crate::gpu::Pass {
+        let mut config = [0u32; 40];
+        config[0] = op;
+        config[3] = flags;
+        config[12..16].copy_from_slice(&desc);
+        crate::gpu::Pass { config, w: out.0, h: out.1, color, format, a, b }
+    }
+
+    /// The warp node (op 0x0E) on the GPU (gpu_warp.wgsl pass 0), mirroring "warp": both inputs
+    /// are read at their own size; a gradient of the node's size takes backward texel differences,
+    /// any other size bilinear differences one gradient texel apart; the source is sampled with
+    /// "bilinear_or" in its node's format. kx, ky and 1/gw, 1/gh are computed here as the CPU does.
+    /// CPU fallbacks: a missing input, SDRT_WARPBIG / SDRT_TEXFLOAT, images over one storage
+    /// binding or sides over 65536 texels, non-finite node constants (after the parameters were
+    /// evaluated: the node variables are restored).
+    #[cfg(feature = "gpu")]
+    fn try_gpu_warp(&mut self, n: &Node) -> bool {
+        use crate::gpu::Src;
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU warp node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        if n.inputs.len() < 2 {
+            return early("missing input");
+        }
+        let (ks, kg) = (n.inputs[0], n.inputs[1]);
+        if ["SDRT_WARPBIG", "SDRT_TEXFLOAT"].iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let (Some(si), Some(gi)) = (self.gpu_image_info(ks), self.gpu_image_info(kg)) else { return early("missing input") };
+        let (w, h) = n.size();
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(si.0, si.1) || !g.fits(gi.0, gi.1) || !g.fits(w, h) {
+            return early("image exceeds one GPU storage binding");
+        }
+        if [si.0, si.1, gi.0, gi.1].iter().any(|&s| s > 65536) {
+            return early("input side over 65536 texels");
+        }
+        // Evaluate the seed and the parameters exactly as exec() and "warp" do.
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let inten = self.param(n, "intensity", seed).map_or(1.0, |v| v[0]);
+        let ps = self.pixelsize(n, seed);
+        let (gw, gh) = (gi.0, gi.1);
+        let (kx, ky) = (inten * gw as f32 / 256.0 * ps.0, inten * gh as f32 / 256.0 * ps.1);
+        let (igw, igh) = (1.0 / gw as f32, 1.0 / gh as f32);
+        if !(kx.is_finite() && ky.is_finite()) {
+            self.node_vars = saved_vars;
+            return early("non-finite intensity or pixelsize");
+        }
+        let wrap = n.b3 & 3;
+        let same = gw == w && gh == h;
+        let (fmt, gfmt) = (self.tex_format(ks), self.tex_format(kg));
+        let flags = wrap | u32::from(same) << 2 | u32::from(gi.2) << 3;
+        let mut pass = Self::filter_pass(0, flags, [si.0 as u32, si.1 as u32, fmt, u32::from(si.2)], (w, h), n.color, n.format(), Src::Node(ks), Src::Node(kg));
+        pass.config[4..8].copy_from_slice(&[gw as u32, gh as u32, gfmt, u32::from(gi.2)]);
+        pass.config[20..24].copy_from_slice(&[kx, ky, igw, igh].map(f32::to_bits));
+        self.gpu_filter_dispatch(n, GPU_WARP, &[ks, kg], None, &[pass]);
+        if log {
+            eprintln!(
+                "GPU warp node {}: shader {} gradient, {w}x{h} from {}x{} gradient {gw}x{gh}, k ({kx}, {ky}) tiling {wrap}",
+                n.index, if same { "texel" } else { "bilinear" }, si.0, si.1
+            );
+        }
+        true
+    }
+
+    /// The directional warp node (op 0x18) on the GPU (gpu_warp.wgsl), mirroring
+    /// "directional_warp": the source is sampled at its own size, the intensity input at the
+    /// node's size (input_at: an image.rs "resized" pass first when its size differs). The
+    /// default intensity 10, the angle's cos/sin (f32, Rust's libm), the pixelsize and v9's third
+    /// parameter (subtracted from the intensity input) give dx, dy and the offset here.
+    /// CPU fallbacks: a missing input, the SDRT_WARPBIG / SDRT_TEXFLOAT / SDRT_DW* / resize
+    /// switches, images over one storage binding or sides over 65536 texels, non-finite node
+    /// constants (the node variables are restored).
+    #[cfg(feature = "gpu")]
+    fn try_gpu_dirwarp(&mut self, n: &Node) -> bool {
+        use crate::gpu::Src;
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU dirwarp node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        if n.inputs.len() < 2 {
+            return early("missing input");
+        }
+        let (ks, ka) = (n.inputs[0], n.inputs[1]);
+        const SWITCHES: [&str; 8] = ["SDRT_WARPBIG", "SDRT_TEXFLOAT", "SDRT_DWDEF", "SDRT_DWDBG", "SDRT_DW3", "SDRT_RESIZE", "SDRT_RESIZEMIP", "SDRT_BIL256"];
+        if SWITCHES.iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let (Some(si), Some(ai)) = (self.gpu_image_info(ks), self.gpu_image_info(ka)) else { return early("missing input") };
+        let (w, h) = n.size();
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(si.0, si.1) || !g.fits(ai.0, ai.1) || !g.fits(w, h) {
+            return early("image exceeds one GPU storage binding");
+        }
+        if [si.0, si.1, ai.0, ai.1].iter().any(|&s| s > 65536) {
+            return early("input side over 65536 texels");
+        }
+        // Evaluate the seed and the parameters exactly as exec() and "directional_warp" do.
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let inten = self.param(n, "intensity", seed).map_or(10.0, |v| v[0]);
+        let ang = self.param(n, "angle", seed).map_or(0.0, |v| v[0]) * std::f32::consts::TAU;
+        let ps = self.pixelsize(n, seed);
+        let sub = self.param(n, "v9third", seed).map_or(0.0, |v| v[0]);
+        let (dx, dy) = (ang.cos() * inten / 256.0 * ps.0, ang.sin() * inten / 256.0 * ps.1);
+        if !(dx.is_finite() && dy.is_finite() && sub.is_finite()) {
+            self.node_vars = saved_vars;
+            return early("non-finite intensity, angle, pixelsize or offset");
+        }
+        let wrap = n.b3 & 3;
+        let fmt = self.tex_format(ks);
+        let mut passes = Vec::new();
+        let amount = if (ai.0, ai.1) == (w, h) {
+            Src::Node(ka)
+        } else {
+            // input_at: the intensity input resized to the node (unquantized, its colour flag)
+            passes.push(Self::filter_pass(2, 0, [ai.0 as u32, ai.1 as u32, 3, u32::from(ai.2)], (w, h), ai.2, 3, Src::Node(ka), Src::None));
+            Src::Pass(0)
+        };
+        let mut pass = Self::filter_pass(1, wrap | u32::from(ai.2) << 3, [si.0 as u32, si.1 as u32, fmt, u32::from(si.2)], (w, h), n.color, n.format(), Src::Node(ks), amount);
+        pass.config[20..24].copy_from_slice(&[dx, dy, sub, 0.0].map(f32::to_bits));
+        passes.push(pass);
+        self.gpu_filter_dispatch(n, GPU_WARP, &[ks, ka], None, &passes);
+        if log {
+            eprintln!(
+                "GPU dirwarp node {}: shader {} {} passes, {w}x{h} from {}x{} intensity {}x{}, d ({dx}, {dy}) offset {sub} tiling {wrap}",
+                n.index, if passes.len() > 1 { "resized-intensity" } else { "direct" }, passes.len(), si.0, si.1, ai.0, ai.1
+            );
+        }
+        true
+    }
+
+    /// The blur node (op 0x14) on the GPU (gpu_blur.wgsl), mirroring "blur": the taps of
+    /// "blur_taps" / "blur_fetches" (per output parity) are computed here and bound as a table.
+    /// - a larger input (both sides >= the node's, not equal): a horizontal pass of "bilinear_or"
+    ///   fetches at its own size (offsets off / w), then "box_pass_parity" along y;
+    /// - otherwise input_at (an image.rs "resized" pass when the size differs), then
+    ///   "box_pass_parity" along x and along y.
+    /// The output keeps the input's colour flag, as box_pass_parity does. CPU fallbacks: a missing
+    /// input, the SDRT_BLUR* / SDRT_TEXFLOAT / resize switches, images over one storage binding or
+    /// sides over 65536 texels, non-finite radii or radii over 4096 pixels (after the parameters
+    /// were evaluated: the node variables are restored).
+    #[cfg(feature = "gpu")]
+    fn try_gpu_blur(&mut self, n: &Node) -> bool {
+        use crate::gpu::Src;
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU blur node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let Some(&k) = n.inputs.first() else { return early("missing input") };
+        const SWITCHES: [&str; 7] = ["SDRT_BLURBIG", "SDRT_BLURYX", "SDRT_BLURBOX", "SDRT_TEXFLOAT", "SDRT_RESIZE", "SDRT_RESIZEMIP", "SDRT_BIL256"];
+        if SWITCHES.iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let Some((nw, nh, color)) = self.gpu_image_info(k) else { return early("missing input") };
+        let (w, h) = n.size();
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(nw, nh) || !g.fits(w, h) {
+            return early("image exceeds one GPU storage binding");
+        }
+        if nw.max(nh) > 65536 {
+            return early("input side over 65536 texels");
+        }
+        // Evaluate the seed and the parameters exactly as exec() and "blur" do.
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let inten = self.param(n, "intensity", seed).map_or(10.0, |v| v[0]);
+        let ps = self.pixelsize(n, seed);
+        let rx = inten * w as f32 / 256.0 * ps.0;
+        let ry = inten * h as f32 / 256.0 * ps.1;
+        if !(rx.abs() <= 4096.0 && ry.abs() <= 4096.0) {
+            self.node_vars = saved_vars;
+            return early("non-finite or huge radius");
+        }
+        let wrap = n.b3 & 3;
+        let big = (nw, nh) != (w, h) && nw >= w && nh >= h;
+        let mut table: Vec<[f32; 4]> = Vec::new();
+        // (start, count) of a tap list in the table
+        let mut push = |taps: Vec<(f32, f32)>| -> [u32; 2] {
+            let start = table.len() as u32;
+            table.extend(taps.iter().map(|&(o, wt)| [o, wt, 0.0, 0.0]));
+            [start, taps.len() as u32]
+        };
+        let box_taps = |r: f32, parity: i64| blur_taps(r, parity).into_iter().map(|(t, wt)| (t as f32, wt)).collect::<Vec<_>>();
+        let node_desc = [w as u32, h as u32, 3, u32::from(color)];
+        let mut passes = Vec::new();
+        let first;
+        if big {
+            // u + off / w as f32: the offsets in u steps
+            let steps = |r: f32, parity: i64| blur_fetches(r, parity).into_iter().map(|(off, wt)| (off / w as f32, wt)).collect::<Vec<_>>();
+            let (e, o) = (push(steps(rx, 0)), push(steps(rx, 1)));
+            let mut p = Self::filter_pass(1, wrap, [nw as u32, nh as u32, self.tex_format(k), u32::from(color)], (w, h), color, 3, Src::Node(k), Src::Node(GPU_TABLE));
+            p.config[4..8].copy_from_slice(&[e[0], e[1], o[0], o[1]]);
+            passes.push(p);
+            first = Src::Pass(0);
+        } else {
+            let mut src = Src::Node(k);
+            if (nw, nh) != (w, h) {
+                passes.push(Self::filter_pass(2, 0, [nw as u32, nh as u32, 3, u32::from(color)], (w, h), color, 3, Src::Node(k), Src::None));
+                src = Src::Pass(0);
+            }
+            let (e, o) = (push(box_taps(rx, 0)), push(box_taps(rx, 1)));
+            let mut p = Self::filter_pass(0, wrap, node_desc, (w, h), color, 3, src, Src::Node(GPU_TABLE));
+            p.config[4..8].copy_from_slice(&[e[0], e[1], o[0], o[1]]);
+            passes.push(p);
+            first = Src::Pass(passes.len() - 1);
+        }
+        let (e, o) = (push(box_taps(ry, 0)), push(box_taps(ry, 1)));
+        let mut p = Self::filter_pass(0, wrap | 0x100, node_desc, (w, h), color, n.format(), first, Src::Node(GPU_TABLE));
+        p.config[4..8].copy_from_slice(&[e[0], e[1], o[0], o[1]]);
+        passes.push(p);
+        if !self.gpu.as_ref().unwrap().fits(table.len(), 1) {
+            self.node_vars = saved_vars;
+            return early("tap table exceeds one GPU storage binding");
+        }
+        let taps = table.len();
+        self.gpu_filter_dispatch(n, GPU_BLUR, &[k], Some(table), &passes);
+        if log {
+            eprintln!(
+                "GPU blur node {}: shader {} {} passes, {w}x{h} from {nw}x{nh}, r ({rx}, {ry}), {taps} taps, tiling {wrap}",
+                n.index, if big { "fetches" } else { "box" }, passes.len()
+            );
+        }
+        true
+    }
+
+    /// The directional motion blur node (op 0x16) on the GPU (gpu_mblur.wgsl), mirroring
+    /// "motion_blur" on input_at (an image.rs "resized" pass first when the size differs):
+    /// - no direction (major == 0): the input itself;
+    /// - one to three taps, or an axis-aligned direction: the point path, "bilinear" taps at the
+    ///   offsets t·dx/major, t·dy/major (computed here);
+    /// - otherwise the sheared image continued past the seam and blurred along the major axis
+    ///   (padded by ep on an untiled minor axis), then sampled back at the unsheared positions;
+    ///   the shear of every row (column) is computed here, the divisions by the padded size use a
+    ///   correctly rounded GPU division (s_div).
+    /// CPU fallbacks: a missing input, the SDRT_DMB* / SDRT_TEXFLOAT / resize switches, images over
+    /// one storage binding or sides over 65536 texels, non-finite radii or radii over 4096 pixels
+    /// (the node variables are restored).
+    #[cfg(feature = "gpu")]
+    fn try_gpu_motion_blur(&mut self, n: &Node) -> bool {
+        use crate::gpu::Src;
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU motionblur node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let Some(&k) = n.inputs.first() else { return early("missing input") };
+        const SWITCHES: [&str; 9] = ["SDRT_TEXFLOAT", "SDRT_BIL256", "SDRT_DMB", "SDRT_DMBSEAM", "SDRT_DMBPAD", "SDRT_DMBQ", "SDRT_DMBEXT", "SDRT_RESIZE", "SDRT_RESIZEMIP"];
+        if SWITCHES.iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let Some((nw, nh, scolor)) = self.gpu_image_info(k) else { return early("missing input") };
+        let (w, h) = n.size();
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(nw, nh) || !g.fits(w, h) {
+            return early("image exceeds one GPU storage binding");
+        }
+        if nw.max(nh) > 65536 {
+            return early("input side over 65536 texels");
+        }
+        // Evaluate the seed and the parameters exactly as exec() and "motion_blur" do.
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let inten = self.param(n, "intensity", seed).map_or(10.0, |v| v[0]);
+        let ang = self.param(n, "angle", seed).map_or(0.0, |v| v[0]) * std::f32::consts::TAU;
+        let wrap = n.b3 & 3;
+        let ps = self.pixelsize(n, seed);
+        let r = inten * w as f32 / 256.0;
+        let (dx, dy) = (ang.cos() * ps.0, ang.sin() * ps.1);
+        let y_major = dy.abs() >= dx.abs();
+        let major = if y_major { dy.abs() } else { dx.abs() };
+        let fmt = self.tex_format(k);
+        let mut passes = Vec::new();
+        // input_at: resized to the node (unquantized, its colour flag)
+        let src = if (nw, nh) == (w, h) {
+            Src::Node(k)
+        } else {
+            passes.push(Self::filter_pass(3, 0, [nw as u32, nh as u32, 3, u32::from(scolor)], (w, h), scolor, 3, Src::Node(k), Src::None));
+            Src::Pass(0)
+        };
+        let path;
+        let mut table: Vec<[f32; 4]> = Vec::new();
+        if major == 0.0 {
+            // the input itself, stored in the node's format with the input's colour flag
+            if let Some(p) = passes.first_mut() {
+                p.format = n.format();
+            } else {
+                passes.push(Self::filter_pass(4, 0, [w as u32, h as u32, 3, u32::from(scolor)], (w, h), scolor, n.format(), src, Src::None));
+            }
+            path = "copy";
+        } else {
+            let radius = 0.5 + (r - 0.5) * major;
+            if !(radius.abs() <= 4096.0) {
+                self.node_vars = saved_vars;
+                return early("non-finite or huge radius");
+            }
+            let taps = box_taps(radius);
+            let axis_aligned = dx.abs().min(dy.abs()) < 1e-6;
+            let desc = [w as u32, h as u32, fmt, u32::from(scolor)];
+            if taps.len() <= 3 || axis_aligned {
+                for &(t, wt) in &taps {
+                    let t = t as f32;
+                    table.push([t * dx / major, t * dy / major, wt, 0.0]);
+                }
+                let mut p = Self::filter_pass(0, wrap, desc, (w, h), n.color, n.format(), src, Src::Node(GPU_TABLE));
+                p.config[4..8].copy_from_slice(&[0, taps.len() as u32, 0, 0]);
+                passes.push(p);
+                path = "point";
+            } else {
+                // an untiled minor axis: the sheared image is wider by the largest shear
+                let ext = if y_major { wrap & 1 == 0 } else { wrap & 2 == 0 };
+                let ep = if ext {
+                    let smax = if y_major { h as f32 * 0.5 * (dx / dy).abs() } else { w as f32 * 0.5 * (dy / dx).abs() };
+                    smax.ceil() as usize + 2
+                } else {
+                    0
+                };
+                let (bw, bh) = if y_major { (w + 2 * ep, h) } else { (w, h + 2 * ep) };
+                if !self.gpu.as_ref().unwrap().fits(bw, bh) {
+                    self.node_vars = saved_vars;
+                    return early("padded image exceeds one GPU storage binding");
+                }
+                let kmax = taps.iter().map(|&(t, _)| t.abs()).max().unwrap_or(0);
+                table.extend(taps.iter().map(|&(t, wt)| [t as f32, wt, 0.0, 0.0]));
+                // the shear of major-axis index j, as the CPU computes it for a row (column)
+                let along = if y_major { h } else { w } as i64;
+                for j in -kmax..along + kmax {
+                    let j = j as f32;
+                    let s = if y_major { (j + 0.5 - h as f32 * 0.5) * dx / dy } else { (j + 0.5 - w as f32 * 0.5) * dy / dx };
+                    table.push([s, 0.0, 0.0, 0.0]);
+                }
+                let values = [0, taps.len() as u32, taps.len() as u32, kmax as u32];
+                let flags = wrap | u32::from(y_major) << 2;
+                let mut shear = Self::filter_pass(1, flags, desc, (bw, bh), n.color, 3, src, Src::Node(GPU_TABLE));
+                shear.config[4..8].copy_from_slice(&values);
+                shear.config[8] = ep as u32;
+                passes.push(shear);
+                let mut unshear = Self::filter_pass(2, flags, [bw as u32, bh as u32, fmt, u32::from(n.color)], (w, h), n.color, n.format(), Src::Pass(passes.len() - 1), Src::Node(GPU_TABLE));
+                unshear.config[4..8].copy_from_slice(&values);
+                unshear.config[8] = ep as u32;
+                passes.push(unshear);
+                path = if ep > 0 { "shear-padded" } else { "shear" };
+            }
+        }
+        if table.iter().flatten().any(|v| !v.is_finite()) || !self.gpu.as_ref().unwrap().fits(table.len().max(1), 1) {
+            self.node_vars = saved_vars;
+            return early("non-finite or oversized tap table");
+        }
+        let entries = table.len();
+        self.gpu_filter_dispatch(n, GPU_MBLUR, &[k], (!table.is_empty()).then_some(table), &passes);
+        if log {
+            eprintln!(
+                "GPU motionblur node {}: shader {path} {} passes, {w}x{h} from {nw}x{nh}, d ({dx}, {dy}) r {r}, {entries} table entries, tiling {wrap}",
+                n.index, passes.len()
+            );
+        }
+        true
+    }
+
+    /// Node k's size and colour flag: resident on the GPU, or computed on the CPU.
+    #[cfg(feature = "gpu")]
+    fn gpu_input(&self, k: usize) -> Option<(usize, usize, bool)> {
+        let g = self.gpu.as_ref().unwrap();
+        g.size(k)
+            .map(|(w, h)| (w, h, g.color(k).unwrap()))
+            .or_else(|| self.images.get(k).and_then(|i| i.as_ref()).map(|im| (im.w, im.h, im.color)))
+    }
+
+    /// One pass of a colour kernel (gradient map, curve, HSL, emboss, dynamic gradient) for node
+    /// n: input_a / input_b are graph nodes (uploaded when the CPU computed them), or input_b is
+    /// a table built on the CPU, uploaded for this dispatch only (as GPU_TABLE, released after
+    /// the submission is recorded). The output becomes resident node n.
+    #[cfg(feature = "gpu")]
+    fn gpu_color_pass(&mut self, n: &Node, kernel: (&'static str, &'static str), config: [u32; 40], color: bool, a: Option<usize>, b: Option<usize>, table: Option<Image>) {
+        use crate::gpu::{Pass, Src};
+        let (w, h) = n.size();
+        let g = self.gpu.as_mut().unwrap();
+        for k in [a, b].into_iter().flatten() {
+            if g.size(k).is_none() {
+                g.upload(k, self.images[k].as_ref().expect("GPU kernel input computed")).expect("GPU upload failed");
+            }
+        }
+        let src_b = match &table {
+            Some(t) => {
+                g.release(GPU_TABLE);
+                g.upload(GPU_TABLE, t).expect("GPU table upload failed");
+                Src::Node(GPU_TABLE)
+            }
+            None => b.map_or(Src::None, Src::Node),
+        };
+        let pass = Pass { config, w, h, color, format: n.format(), a: a.map_or(Src::None, Src::Node), b: src_b };
+        g.dispatch_passes(n.index, kernel, &[pass]).unwrap_or_else(|e| panic!("Vulkan {} dispatch failed: {e}", kernel.0));
+        if table.is_some() {
+            g.release(GPU_TABLE);
+        }
+        self.images[n.index] = None;
+    }
+
+    /// The gradient map (op 0x00) on the GPU (gpu_gradient.wgsl). The table is built on the CPU
+    /// exactly as "gradient_map" builds it (same keys, same rules per version and format):
+    /// v8word or a float node format: the 1024-texel f32 table ("gradient_lut_f32"), sampled as
+    /// "sample_f32_lut" (f64 mix reproduced in integer arithmetic) with half-float truncation;
+    /// otherwise the 256-texel UNORM16 table ("gradient_lut16") interpolated in integers.
+    /// CPU fallbacks: a missing input, an input of another size (the CPU resizes it), the
+    /// SDRT_GM* switches, images over one storage binding, and f32 tables the integer mix does
+    /// not cover (non-finite texels, magnitudes below 2^-95, neighbours 2^31 apart).
+    #[cfg(feature = "gpu")]
+    fn try_gpu_gradient_map(&mut self, n: &Node) -> bool {
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU gradient map node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let k = n.inputs[0];
+        if k >= self.p.nodes.len() {
+            return early("missing input");
+        }
+        if ["SDRT_GMREP", "SDRT_GMDBG", "SDRT_GMV8MID", "SDRT_GMV8", "SDRT_GMLUT"].iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let (w, h) = n.size();
+        let Some((sw, sh, src_color)) = self.gpu_input(k) else { return early("input not computed") };
+        if (sw, sh) != (w, h) {
+            return early("input of another size");
+        }
+        if !self.gpu.as_ref().unwrap().fits(w, h) {
+            return early("image exceeds one GPU storage binding");
+        }
+        // exactly as exec() + gradient_map: the seed (a function may set node variables), v8word
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let v8w_param = self.param(n, "v8word", seed).and_then(|v| v.first().copied()).unwrap_or(0.0);
+        let (version, b3) = (self.p.version, n.b3);
+        let has_v8w = version >= 8 && b3 & 2 != 0;
+        let repeat = if version >= 8 { b3 & 8 != 0 } else { b3 & 4 != 0 };
+        let mid = b3 & 1 != 0;
+        let smooth = if version >= 8 && mid { true } else { !mid && version < 8 };
+        let v8w = if has_v8w { v8w_param } else { 0.0 };
+        let keys = self.gradient_keys(n);
+        let float_table = has_v8w || n.format() >= 2;
+        let table: Vec<[f32; 4]> = if float_table {
+            let lut = gradient_lut_f32(&keys, has_v8w, v8w, smooth);
+            if let Err(why) = gpu_mixable(&lut, repeat) {
+                self.node_vars = saved_vars;
+                return early(&format!("f32 table outside the integer mix's range, {why}"));
+            }
+            lut.to_vec()
+        } else {
+            // 16-bit codes as exact floats
+            gradient_lut16(&keys, v8w, smooth, 256).iter().map(|t| t.map(|c| c as f32)).collect()
+        };
+        let mut config = [0u32; 40];
+        config[0] = u32::from(!float_table);
+        config[3] = u32::from(repeat) | u32::from(float_table && n.format() == 2) << 1 | u32::from(src_color) << 2;
+        let lut = Image { w: table.len(), h: 1, color: true, px: table };
+        self.gpu_color_pass(n, GPU_GRADIENT, config, n.color, Some(k), None, Some(lut));
+        if log {
+            eprintln!(
+                "GPU gradient map node {}: shader {} table, {} keys, repeat {repeat}, v{version} b3 {b3:#x}",
+                n.index, if float_table { "f32" } else { "unorm16" }, keys.len()
+            );
+        }
+        true
+    }
+
+    /// HSL (op 0x1C) on the GPU (gpu_hsl.wgsl): "hsl", "rgb_to_hsl", "hsl_to_rgb" per pixel.
+    /// CPU fallbacks: a missing input, an input of another size, images over one binding.
+    #[cfg(feature = "gpu")]
+    fn try_gpu_hsl(&mut self, n: &Node) -> bool {
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU hsl node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let k = n.inputs[0];
+        if k >= self.p.nodes.len() {
+            return early("missing input");
+        }
+        let (w, h) = n.size();
+        let Some((sw, sh, _)) = self.gpu_input(k) else { return early("input not computed") };
+        if (sw, sh) != (w, h) {
+            return early("input of another size");
+        }
+        if !self.gpu.as_ref().unwrap().fits(w, h) {
+            return early("image exceeds one GPU storage binding");
+        }
+        // exactly as exec() + hsl: the seed, then hue, saturation, luminosity
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let hue = self.param(n, "hue", seed).map_or(0.5, |v| v[0]);
+        let sat = self.param(n, "saturation", seed).map_or(0.5, |v| v[0]);
+        let lum = self.param(n, "luminosity", seed).map_or(0.5, |v| v[0]);
+        let mut config = [0u32; 40];
+        // the shifts as the CPU computes them for every pixel, and its f32 constants
+        config[4..8].copy_from_slice(&[(hue - 0.5) * 2.0, 2.0 * (sat - 0.5), 2.0 * (lum - 0.5), 0.0].map(f32::to_bits));
+        config[8..12].copy_from_slice(&[1.0f32 / 3.0, 1.0 / 6.0, 2.0 / 3.0, 0.0].map(f32::to_bits));
+        // the CPU's output image is colour whatever the node's flag
+        self.gpu_color_pass(n, GPU_HSL, config, true, Some(k), None, None);
+        if log {
+            eprintln!("GPU hsl node {}: shader, hue {hue} saturation {sat} luminosity {lum}", n.index);
+        }
+        true
+    }
+
+    /// Emboss (op 0x10) on the GPU (gpu_emboss.wgsl): "emboss" per pixel; a height of the node's
+    /// size takes texel differences, any other size three texture-unit samples (the CPU reads
+    /// it at its own size). The light angle's cos/sin are computed once on the CPU.
+    /// CPU fallbacks: missing inputs, a source of another size, SDRT_WARPBIG / SDRT_TEXFLOAT,
+    /// images over one binding.
+    #[cfg(feature = "gpu")]
+    fn try_gpu_emboss(&mut self, n: &Node) -> bool {
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU emboss node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let (a, hk) = (n.inputs[0], n.inputs[1]);
+        if a >= self.p.nodes.len() || hk >= self.p.nodes.len() {
+            return early("missing input");
+        }
+        if ["SDRT_WARPBIG", "SDRT_TEXFLOAT"].iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let (w, h) = n.size();
+        let (Some((sw, sh, _)), Some((hw, hh, hcolor))) = (self.gpu_input(a), self.gpu_input(hk)) else { return early("input not computed") };
+        if (sw, sh) != (w, h) {
+            return early("source of another size");
+        }
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(w, h) || !g.fits(hw, hh) {
+            return early("image exceeds one GPU storage binding");
+        }
+        let hfmt = self.tex_format(hk);
+        // exactly as exec() + emboss: the seed, intensity, light angle, highlight, shadow, pixel size
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let inten = self.param(n, "intensity", seed).map_or(5.0, |v| v[0]);
+        let ang = self.param(n, "lightangle", seed).map_or(0.0, |v| v[0]) * std::f32::consts::TAU;
+        let hl = self.param(n, "highlight", seed).unwrap_or(vec![1.0; 4]);
+        let sh = self.param(n, "shadow", seed).unwrap_or(vec![0.0, 0.0, 0.0, 1.0]);
+        let ps = self.pixelsize(n, seed);
+        let same = hw == w && hh == h;
+        let (kx, ky) = (inten * hw as f32 / 256.0 * ps.0, inten * hh as f32 / 256.0 * ps.1);
+        let (ca, sa) = (ang.cos(), ang.sin());
+        let ch = |c: usize| if n.color { c } else { 0 };
+        let mut config = [0u32; 40];
+        config[3] = (n.b3 & 3) | u32::from(same) << 2 | u32::from(hcolor) << 3;
+        config[4..8].copy_from_slice(&[kx, ky, ca, sa].map(f32::to_bits));
+        config[8..12].copy_from_slice(&[1.0 / hw as f32, 1.0 / hh as f32, 0.0, 0.0].map(f32::to_bits));
+        config[12..16].copy_from_slice(&[hw as u32, hh as u32, hfmt, u32::from(hcolor)]);
+        config[20..24].copy_from_slice(&[hl[ch(0)], hl[ch(1)], hl[ch(2)], 0.0].map(f32::to_bits));
+        config[24..28].copy_from_slice(&[1.0 - sh[ch(0)], 1.0 - sh[ch(1)], 1.0 - sh[ch(2)], 0.0].map(f32::to_bits));
+        self.gpu_color_pass(n, GPU_EMBOSS, config, n.color, Some(a), Some(hk), None);
+        if log {
+            eprintln!("GPU emboss node {}: shader, height {hw}x{hh} ({}), kx {kx} ky {ky} angle {ang}", n.index, if same { "texel differences" } else { "sampled" });
+        }
+        true
+    }
+
+    /// The dynamic gradient (op 0x26) on the GPU (gpu_dyngrad.wgsl): "dyn_gradient" per pixel,
+    /// the gradient image sampled by the texture unit's bilinear at its own size.
+    /// CPU fallbacks: missing inputs, a source of another size, SDRT_TEXFLOAT, a gradient with a
+    /// side that is not a power of two (inexact reciprocal), a non-finite or huge coordinate,
+    /// images over one binding.
+    #[cfg(feature = "gpu")]
+    fn try_gpu_dyn_gradient(&mut self, n: &Node) -> bool {
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU dynamic gradient node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let (a, gk) = (n.inputs[0], n.inputs[1]);
+        if a >= self.p.nodes.len() || gk >= self.p.nodes.len() {
+            return early("missing input");
+        }
+        if crate::envc::var("SDRT_TEXFLOAT").is_ok() {
+            return early("experiment switch");
+        }
+        let (w, h) = n.size();
+        let (Some((sw, sh, src_color)), Some((gw, gh, gcolor))) = (self.gpu_input(a), self.gpu_input(gk)) else { return early("input not computed") };
+        if (sw, sh) != (w, h) {
+            return early("source of another size");
+        }
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(w, h) || !g.fits(gw, gh) {
+            return early("image exceeds one GPU storage binding");
+        }
+        if !gw.is_power_of_two() || !gh.is_power_of_two() {
+            return early("gradient side not a power of two");
+        }
+        let gfmt = self.tex_format(gk);
+        // exactly as exec() + dyn_gradient: the seed, then the coordinate
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        let seed = self.seed(n);
+        let coord = self.param(n, "coordinate", seed).map_or(0.0, |v| v[0]);
+        // the sampler's texel index is an i32 on the GPU (i64 on the CPU)
+        if !coord.is_finite() || coord.abs() * gw.max(gh) as f32 >= 16_777_216.0 {
+            self.node_vars = saved_vars;
+            return early("coordinate out of range");
+        }
+        let (repeat, vertical) = (n.b3 & 1 != 0, n.b3 & 8 != 0);
+        let mut config = [0u32; 40];
+        config[3] = u32::from(repeat) | u32::from(vertical) << 1 | u32::from(src_color) << 2;
+        config[4..8].copy_from_slice(&[coord, gw as f32 - 1.0, gh as f32 - 1.0, 1.0 / gw as f32].map(f32::to_bits));
+        config[8] = (1.0 / gh as f32).to_bits();
+        config[12..16].copy_from_slice(&[gw as u32, gh as u32, gfmt, u32::from(gcolor)]);
+        self.gpu_color_pass(n, GPU_DYNGRAD, config, n.color, Some(a), Some(gk), None);
+        if log {
+            eprintln!("GPU dynamic gradient node {}: shader, gradient {gw}x{gh} format {gfmt}, coordinate {coord}, repeat {repeat}, vertical {vertical}", n.index);
+        }
+        true
+    }
+
+    /// The curve (op 0x2C) on the GPU (gpu_curve.wgsl). The CPU evaluates each curve through a
+    /// table of 1025 "bezier_curve" values interpolated with 1/256 fractions; that very table
+    /// is built here and uploaded, the kernel does the per-pixel lookup.
+    /// CPU fallbacks: a missing input, an input of another size (unless the curve runs along x
+    /// and does not read it), the SDRT_CURVE* switches, tables outside the normal f32 range
+    /// (the GPU flushes subnormal results), images over one binding.
+    #[cfg(feature = "gpu")]
+    fn try_gpu_curve(&mut self, n: &Node) -> bool {
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let early = |why: &str| {
+            if log {
+                eprintln!("GPU curve node {}: CPU fallback ({why})", n.index);
+            }
+            false
+        };
+        let k = n.inputs[0];
+        if k >= self.p.nodes.len() {
+            return early("missing input");
+        }
+        if ["SDRT_CURVEX", "SDRT_CURVEXT", "SDRT_CURVELUT", "SDRT_CURVELUTN", "SDRT_CURVELUTQ"].iter().any(|s| crate::envc::var(s).is_ok()) {
+            return early("experiment switch");
+        }
+        let (w, h) = n.size();
+        let Some((sw, sh, _)) = self.gpu_input(k) else { return early("input not computed") };
+        let along_x = n.b3 & 2 != 0;
+        if (sw, sh) != (w, h) && !along_x {
+            return early("input of another size");
+        }
+        if !self.gpu.as_ref().unwrap().fits(w, h) {
+            return early("image exceeds one GPU storage binding");
+        }
+        // exec() evaluates the seed (curve takes no parameter)
+        let saved_vars = self.node_vars.clone();
+        self.cur_size = [w as f32, h as f32];
+        self.seed(n);
+        let curves = self.curve_points(n);
+        let tables: Vec<Vec<f32>> = curves.iter().map(|c| (0..=1024).map(|i| bezier_curve(c, i as f32 / 1024.0)).collect()).collect();
+        let normal = |v: f32| v == 0.0 || (v.is_finite() && v.abs() >= f32::from_bits(37 << 23) && v.abs() <= f32::from_bits(253 << 23));
+        if !tables.iter().zip(&curves).all(|(t, c)| c.is_empty() || t.iter().all(|&v| normal(v))) {
+            self.node_vars = saved_vars;
+            return early("table outside the normal f32 range");
+        }
+        let flat: Vec<f32> = tables.concat();
+        let px: Vec<[f32; 4]> = flat.chunks(4).map(|c| std::array::from_fn(|j| c.get(j).copied().unwrap_or(0.0))).collect();
+        let mut config = [0u32; 40];
+        config[3] = u32::from(along_x) | u32::from(n.color) << 1;
+        for (c, pts) in curves.iter().enumerate() {
+            if pts.is_empty() {
+                config[3] |= 1 << (8 + c);
+            }
+        }
+        let table = Image { w: px.len(), h: 1, color: true, px };
+        self.gpu_color_pass(n, GPU_CURVE, config, n.color, if along_x { None } else { Some(k) }, None, Some(table));
+        if log {
+            eprintln!("GPU curve node {}: shader, {} curves ({:?} points){}", n.index, curves.len(), curves.iter().map(Vec::len).collect::<Vec<_>>(), if along_x { ", along x" } else { "" });
+        }
+        true
+    }
+
     #[cfg(feature = "gpu")]
     fn materialize(&mut self, k: usize) {
         if k >= self.images.len() || self.images[k].is_some() {
@@ -649,6 +1409,13 @@ impl<'p> Runtime<'p> {
     fn try_gpu(&mut self, n: &Node) -> bool {
         if self.gpu.is_none() {
             return false;
+        }
+        // research aid: SDRT_GPU_OPS=00,2c,... (hex opcodes) keeps every other node on the CPU,
+        // so a real-file check of these kernels sees CPU inputs (identical in both backends)
+        if let Ok(ops) = crate::envc::var("SDRT_GPU_OPS") {
+            if !ops.split(',').any(|o| u32::from_str_radix(o.trim(), 16) == Ok(n.op)) {
+                return false;
+            }
         }
         if (n.op==0x02 && ["SDRT_MIX","SDRT_DIVNAN"].iter().any(|s|crate::envc::var(s).is_ok()))
             || (n.op==0x1e && crate::envc::var("SDRT_LVPCLAMP").as_deref()==Ok("0")) {
@@ -668,6 +1435,7 @@ impl<'p> Runtime<'p> {
                 return false;
             }
             let f = self.func(n.data);
+            crate::gpu_pp::NODE.with(|c| c.set(n.index));
             let mut shader = match crate::gpu_pp::compile(&f, &|uid| self.input(uid), &|k| self.vp_slot(k), &self.node_vars) {
                 Ok(s) => s,
                 Err(reason) => {
@@ -705,14 +1473,20 @@ impl<'p> Runtime<'p> {
             if crate::envc::var("SDRT_GPU_LOG").is_ok() {
                 // logged before the dispatch: pipeline creation (the driver's compiler) is the step
                 // that can take long for big control-flow shaders
-                eprintln!("GPU PP node {}: shader ({} instructions, {} WGSL bytes)", n.index, f.ins.len(), shader.len());
+                eprintln!("GPU PP node {}: shader ({} instructions, {} WGSL bytes, {} values{})", n.index, f.ins.len(), shader.text.len(), shader.lits.len(), if shader.flow { ", control flow" } else { "" });
             }
             if let Ok(dir) = crate::envc::var("SDRT_GPU_DUMP") {
-                // research aid: the generated WGSL of each PP node, DIR/pp_<node>.wgsl
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("pp_{}.wgsl", n.index)), &shader);
+                // research aid: the generated WGSL of each PP node, DIR/pp_<node>.wgsl, its
+                // per-node values and the function's instructions
+                let dir = std::path::Path::new(&dir);
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("pp_{}.wgsl", n.index)), &shader.text);
+                let lits: Vec<String> = shader.lits.iter().zip(&shader.moved).map(|(w, id)| format!("{w:#010x} {id}")).collect();
+                let _ = std::fs::write(dir.join(format!("pp_{}.lits", n.index)), lits.join("\n") + "\n");
+                let ins: Vec<String> = f.ins.iter().enumerate().map(|(k, i)| format!("{k}: op {} ty {} {:?}", i.op, i.ty, &*i.ops)).collect();
+                let _ = std::fs::write(dir.join(format!("pp_{}.ins", n.index)), ins.join("\n") + "\n");
             }
-            self.gpu.as_mut().unwrap().dispatch(n.index, w, h, n.color, n.format(), &config, ids[0], ids[1], Some(&shader), &sources).expect("Vulkan PP dispatch failed");
+            self.gpu.as_mut().unwrap().dispatch(n.index, w, h, n.color, n.format(), &config, ids[0], ids[1], Some((&shader.text, &shader.lits)), &sources).expect("Vulkan PP dispatch failed");
             self.images[n.index] = None;
             return true;
         }
@@ -720,6 +1494,17 @@ impl<'p> Runtime<'p> {
             // try_gpu_transform logs its own fallback reasons.
             return self.try_gpu_transform(n);
         }
+        // The filter ports log their own fallback reasons too.
+        if n.op == 0x0E { return self.try_gpu_warp(n); }
+        if n.op == 0x18 { return self.try_gpu_dirwarp(n); }
+        if n.op == 0x14 { return self.try_gpu_blur(n); }
+        if n.op == 0x16 { return self.try_gpu_motion_blur(n); }
+        // the colour kernels log their own fallback reasons too
+        if n.op == 0x00 { return self.try_gpu_gradient_map(n); }
+        if n.op == 0x1C { return self.try_gpu_hsl(n); }
+        if n.op == 0x10 { return self.try_gpu_emboss(n); }
+        if n.op == 0x26 { return self.try_gpu_dyn_gradient(n); }
+        if n.op == 0x2C { return self.try_gpu_curve(n); }
         if !matches!(n.op, 0x0c | 0x06 | 0x02 | 0x1e | 0x24 | 0x1a) {
             return false;
         }
@@ -1849,17 +2634,7 @@ impl<'p> Runtime<'p> {
     fn curve(&mut self, n: &Node) -> Image {
         let (w, h) = n.size();
         let src = self.input_at(n.inputs[0], w, h);
-        let p = self.p;
-        let mut curves: Vec<Vec<[f32; 6]>> = vec![];
-        let mut o = n.data;
-        // each curve: u32 n, n points (own length; all 52 color curves of the Adobe corpus, e.g.
-        // brushed-gold node 77 with empty R, G, B, A curves after a 4-point luminance curve)
-        for _ in 0..(if n.color { 5 } else { 1 }) {
-            let k = (p.w(o) as usize).min(n.count as usize);
-            let pts = (0..k).map(|i| std::array::from_fn(|j| p.f(o + 4 + 24 * i + 4 * j))).collect();
-            curves.push(pts);
-            o += 4 + 24 * k;
-        }
+        let curves = self.curve_points(n);
         let mut out = Image::new(w, h, n.color, [0.0; 4]);
         use rayon::prelude::*;
         let color = n.color;
@@ -1914,6 +2689,24 @@ impl<'p> Runtime<'p> {
             };
         });
         out
+    }
+
+    /// A curve node's Bézier curves: one (gray) or five (colour: luminance, R, G, B, A), each a
+    /// u32 count then its points (x, y, left handle, right handle), shared by the CPU path and
+    /// try_gpu_curve.
+    fn curve_points(&self, n: &Node) -> Vec<Vec<[f32; 6]>> {
+        let p = self.p;
+        let mut curves: Vec<Vec<[f32; 6]>> = vec![];
+        let mut o = n.data;
+        // each curve: u32 n, n points (own length; all 52 color curves of the Adobe corpus, e.g.
+        // brushed-gold node 77 with empty R, G, B, A curves after a 4-point luminance curve)
+        for _ in 0..(if n.color { 5 } else { 1 }) {
+            let k = (p.w(o) as usize).min(n.count as usize);
+            let pts = (0..k).map(|i| std::array::from_fn(|j| p.f(o + 4 + 24 * i + 4 * j))).collect();
+            curves.push(pts);
+            o += 4 + 24 * k;
+        }
+        curves
     }
 
     /// Distance: 1 − d/D, d = Euclidean distance in pixels to the nearest mask pixel (> 0.5), D =
@@ -2377,28 +3170,7 @@ impl<'p> Runtime<'p> {
         let repeat = crate::envc::var("SDRT_GMREP").as_deref() != Ok("0")
             && if p.version >= 8 { b3 & 8 != 0 } else { b3 & 4 != 0 };
         let mid = b3 & 1 != 0;
-        let mut keys: Vec<(f32, [f32; 4])> = vec![];
-        let mut o = n.data;
-        for _ in 0..n.count {
-            if floats_keys {
-                let pos = p.f(o);
-                let c = if n.color { [p.f(o + 4), p.f(o + 8), p.f(o + 12), p.f(o + 16)] } else { Image::gray(p.f(o + 4)) };
-                keys.push((pos, c));
-                o += 4 * ((if n.color { 5 } else { 2 }) + mid as usize);
-            } else {
-                let b = p.bytes(o, 8);
-                let pos = u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0;
-                let c = if n.color {
-                    [b[2] as f32 / 255.0, b[3] as f32 / 255.0, b[4] as f32 / 255.0, b[5] as f32 / 255.0]
-                } else {
-                    Image::gray(u16::from_le_bytes([b[2], b[3]]) as f32 / 65535.0)
-                };
-                keys.push((pos, c));
-                o += (if n.color { 6 } else { 4 }) + if mid { 2 } else { 0 };
-            }
-        }
-
-        keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let keys = self.gradient_keys(n);
         if crate::envc::var("SDRT_GMDBG").is_ok() { eprintln!("gm node {} keys (float {} mid {} rep {} v{} b3 {:#x} v8word {:?}): {:?}", n.index, floats_keys, mid, repeat, p.version, n.b3, n.param("v8word"), keys); }
         // keys interpolate linearly when byte3 bit 0 (midpoints) is set, with smoothstep otherwise
         // (the midpoint value has no effect); v8+ files interpolate linearly without the bit
@@ -2416,11 +3188,7 @@ impl<'p> Runtime<'p> {
         // - UNORM8/16 without v8word (fmt <= 1): 256-texel UNORM16 LUT interpolated in 16-bit ints.
         // SDRT_GMLUT=0 evaluates keys directly; SDRT_GMLUT=<N> forces an N-texel UNORM16 LUT.
         if mode.is_err() && (has_v8w || n.format() >= 2) {
-            let lut_f32: [[f32; 4]; 1024] = if has_v8w {
-                build_v8_lut(&keys, v8w)
-            } else {
-                std::array::from_fn(|i| lookup64(&keys, i as f64 / 1023.0, smooth).map(|v| v as f32))
-            };
+            let lut_f32 = gradient_lut_f32(&keys, has_v8w, v8w, smooth);
             let is_f16 = n.format() == 2;
             let mut out = Image::new(w, h, n.color, [0.0; 4]);
             for (dst, s) in out.px.iter_mut().zip(&src.px) {
@@ -2440,11 +3208,7 @@ impl<'p> Runtime<'p> {
             Ok(s) => s.parse::<usize>().ok().filter(|&nl| nl >= 2),
             Err(_) => Some(256),
         };
-        let lut16: Option<Vec<[u32; 4]>> = n_lut.map(|nl| {
-            let denom = (nl - 1) as f64;
-            (0..nl).map(|i| (if v8w != 0.0 { lookup_smooth(&keys, i as f64 / denom, v8w as f64) } else { lookup64(&keys, i as f64 / denom, smooth) })
-                .map(|v| (((v as f32) * 65535.0).clamp(0.0, 65535.0) as f64 + 0.5).floor() as u32)).collect()
-        });
+        let lut16: Option<Vec<[u32; 4]>> = n_lut.map(|nl| gradient_lut16(&keys, v8w, smooth, nl));
         let mut out = Image::new(w, h, n.color, [0.0; 4]);
         for k in 0..w * h {
             let s = src.px[k];
@@ -2496,6 +3260,39 @@ impl<'p> Runtime<'p> {
             };
         }
         out
+    }
+
+    /// A gradient map's keys, sorted by position: float keys (byte3 bit 2 from v8 on, bit 1
+    /// before) or 16-bit positions with 8-bit colours / 16-bit grays; byte3 bit 0 adds a
+    /// midpoint to each key (shared by the CPU path and try_gpu_gradient_map).
+    fn gradient_keys(&self, n: &Node) -> Vec<(f32, [f32; 4])> {
+        let p = self.p;
+        let b3 = n.b3;
+        let floats_keys = if p.version >= 8 { b3 & 4 != 0 } else { b3 & 2 != 0 };
+        let mid = b3 & 1 != 0;
+        let mut keys: Vec<(f32, [f32; 4])> = vec![];
+        let mut o = n.data;
+        for _ in 0..n.count {
+            if floats_keys {
+                let pos = p.f(o);
+                let c = if n.color { [p.f(o + 4), p.f(o + 8), p.f(o + 12), p.f(o + 16)] } else { Image::gray(p.f(o + 4)) };
+                keys.push((pos, c));
+                o += 4 * ((if n.color { 5 } else { 2 }) + mid as usize);
+            } else {
+                let b = p.bytes(o, 8);
+                let pos = u16::from_le_bytes([b[0], b[1]]) as f32 / 65535.0;
+                let c = if n.color {
+                    [b[2] as f32 / 255.0, b[3] as f32 / 255.0, b[4] as f32 / 255.0, b[5] as f32 / 255.0]
+                } else {
+                    Image::gray(u16::from_le_bytes([b[2], b[3]]) as f32 / 65535.0)
+                };
+                keys.push((pos, c));
+                o += (if n.color { 6 } else { 4 }) + if mid { 2 } else { 0 };
+            }
+        }
+
+        keys.sort_by(|a, b| a.0.total_cmp(&b.0));
+        keys
     }
 
     fn bitmap(&mut self, n: &Node) -> Image {
@@ -2898,6 +3695,24 @@ fn box_pass_taps(src: &Image, taps: &[(i64, f32)], dir: (i64, i64), wrap: (bool,
     o
 }
 
+/// A gradient map's 1024-texel unclamped f32 table (v8word, or a float node format): the v8+
+/// Bézier table, or the gradient at i/1023 in f64 (shared by the CPU and GPU paths).
+fn gradient_lut_f32(keys: &[(f32, [f32; 4])], has_v8w: bool, v8w: f32, smooth: bool) -> [[f32; 4]; 1024] {
+    if has_v8w {
+        build_v8_lut(keys, v8w)
+    } else {
+        std::array::from_fn(|i| lookup64(keys, i as f64 / 1023.0, smooth).map(|v| v as f32))
+    }
+}
+
+/// A gradient map's nl-texel UNORM16 table (UNORM node formats without v8word): the gradient
+/// at i/(nl - 1), rounded to 16-bit codes (shared by the CPU and GPU paths).
+fn gradient_lut16(keys: &[(f32, [f32; 4])], v8w: f32, smooth: bool, nl: usize) -> Vec<[u32; 4]> {
+    let denom = (nl - 1) as f64;
+    (0..nl).map(|i| (if v8w != 0.0 { lookup_smooth(keys, i as f64 / denom, v8w as f64) } else { lookup64(keys, i as f64 / denom, smooth) })
+        .map(|v| (((v as f32) * 65535.0).clamp(0.0, 65535.0) as f64 + 0.5).floor() as u32)).collect()
+}
+
 /// Build the exact 1024-texel unclamped f32 LUT for v8+ gradient maps with `v8word` (byte3 bit 1),
 /// verified to ≤ 1 f32 ULP across 55 full/zoom probes and edge cases on sbsrender 14.1 vk
 /// (cx/gmv8_2/REPORT.md). Keys must already be sorted by position.
@@ -3044,6 +3859,36 @@ fn sample_f32_lut(lut: &[[f32; 4]; 1024], x: f32, repeat: bool) -> [f32; 4] {
     }
     let wf = wt as f64;
     std::array::from_fn(|c| (p0[c] as f64 * (1.0 - wf) + p1[c] as f64 * wf) as f32)
+}
+
+/// Whether the GPU's integer reproduction of sample_f32_lut's f64 mix (gpu_color_common.wgsl
+/// "mix_f64") covers this table: finite texels that are zero or at least 2^-95 in magnitude
+/// (no subnormal result is possible then), and neighbouring finite non-zero texels (every pair
+/// a lookup can mix, with the wrap-around pair when repeating) whose exponents differ by at
+/// most 31 (their aligned sum fits 64 bits). Infinities and NaNs (build_v8_lut between keys at
+/// one position) are reproduced, except two NaNs of different payloads side by side (which one
+/// the f64 addition propagates depends on the compiler's operand order).
+#[cfg(feature = "gpu")]
+fn gpu_mixable(lut: &[[f32; 4]], repeat: bool) -> Result<(), String> {
+    let tiny = f32::from_bits(32 << 23);
+    let exponent = |v: f32| ((v.to_bits() >> 23) & 255) as i32;
+    if let Some((i, v)) = lut.iter().flatten().enumerate().find(|&(_, &v)| v.is_finite() && v != 0.0 && v.abs() < tiny) {
+        return Err(format!("texel {} channel {}: {v:e}", i / 4, i % 4));
+    }
+    let n = lut.len();
+    let pairs = (0..n - 1).map(|i| (i, i + 1)).chain(repeat.then_some((n - 1, 0)));
+    for (i, j) in pairs {
+        for c in 0..4 {
+            let (a, b) = (lut[i][c], lut[j][c]);
+            if a.is_nan() && b.is_nan() && (a.to_bits() | 0x40_0000) != (b.to_bits() | 0x40_0000) {
+                return Err(format!("texels {i}/{j} channel {c}: two different NaNs"));
+            }
+            if a.is_finite() && b.is_finite() && a != 0.0 && b != 0.0 && (exponent(a) - exponent(b)).abs() > 31 {
+                return Err(format!("texels {i}/{j} channel {c}: {a:e} next to {b:e}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// v8+ "smooth" gradient (direct f64 fallback for SDRT_GMLUT=0).

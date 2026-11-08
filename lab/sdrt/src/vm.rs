@@ -355,6 +355,41 @@ impl Func {
         found
     }
 
+    /// Whether component c of register k is materialized in an untaken branch (`hoist`).
+    #[cfg(feature = "gpu")]
+    pub fn gpu_hoisted(&self, k: usize, c: usize) -> bool {
+        k < self.ins.len() && self.hoist[k][clamp_comp(&self.ins, k, c)]
+    }
+
+    /// The operand components computing component c of register k reads, in evaluation order.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_reads(&self, k: usize, c: usize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        if k < self.ins.len() {
+            scalar_reads(&self.ins, &self.side, k, clamp_comp(&self.ins, k, c), &mut out);
+        }
+        out
+    }
+
+    /// Registers whose value can change between evaluations of the same pixel's function:
+    /// variable reads/writes, writes, loops, rand, or anything computed from them (the
+    /// decoder's `volatile`). The others have no side effects and depend on nothing stateful.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_volatile(&self) -> Vec<bool> {
+        let mut volatile = vec![false; self.ins.len()];
+        for (k, i) in self.ins.iter().enumerate() {
+            volatile[k] = matches!(i.op, 4 | 6 | 7 | 11 | 50) || reg_operands(i).iter().any(|&r| (r as usize) < k && volatile[r as usize]);
+        }
+        volatile
+    }
+
+    /// Whether register k names a register operand at or after itself (scalar_reads skips
+    /// those; the evaluator would still compute them).
+    #[cfg(feature = "gpu")]
+    pub fn gpu_forward(&self, k: usize) -> bool {
+        k < self.ins.len() && reg_operands(&self.ins[k]).iter().any(|&r| (r as usize) >= k && (r as usize) < self.ins.len())
+    }
+
     /// Registers whose value is the same at every pixel of a pixel processor: no $pos, sampler,
     /// rand, variable, write or loop below them.
     pub fn pixel_invariant(&self) -> Vec<bool> {
