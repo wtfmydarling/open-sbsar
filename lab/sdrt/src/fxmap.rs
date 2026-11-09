@@ -639,7 +639,7 @@ impl<'a> Ctx<'a> {
     /// variables (a copy), draws recorded.
     fn worker(&self) -> Ctx<'a> {
         Ctx {
-            gpu_collect: false,
+            gpu_collect: self.gpu_collect,
             deferred: Some(vec![]),
             collect: None,
             snaps: vec![],
@@ -678,6 +678,107 @@ impl<'a> Ctx<'a> {
         }
         let sum: f32 = (0..=self.max_depth).map(|k| h.powi(k as i32)).sum();
         h.powi(depth as i32) / sum
+    }
+
+    /// Upper bound on the number of draws a tree can produce, evaluated without allocating
+    /// DrawRecs or traversing identical subtree copies. Used to decide before collecting whether
+    /// a node will exceed the GPU draw budget and should fall back immediately to CPU.
+    fn estimate_draws(&self, off: usize, st: State, limit: usize) -> usize {
+        if off == 0 || st.depth > 64 {
+            return 0;
+        }
+        let p = self.p;
+        let w = p.w(off);
+        let kind = w & 7;
+        let mut o = off + 4;
+        match kind {
+            0 => {
+                let src = (w >> 6) & 3;
+                let mut count = if src != 0 { 1usize } else { 0usize };
+                let ifl = if w & 0x8000_0000 != 0 { o += 4; p.w(off + 4) } else { 0 };
+                if (w & 0x30) != 0 || [19, 21, 23, 25, 27, 29].iter().any(|b| (w >> b) & 3 != 0) || ifl & 2 != 0 {
+                    o += 4;
+                }
+                let depth = st.depth + 1;
+                if w & 0x10000 != 0 {
+                    for k in 0..4 {
+                        let child = p.w(o + 4 * k) as usize;
+                        if child != 0 {
+                            count = count.saturating_add(self.estimate_draws(child, State { depth, ..st }, limit));
+                            if count >= limit {
+                                return limit;
+                            }
+                        }
+                    }
+                } else if w & 0x20000 != 0 {
+                    let child = p.w(o) as usize;
+                    if child != 0 {
+                        let c = self.estimate_draws(child, State { depth, ..st }, limit);
+                        count = count.saturating_add(c.saturating_mul(4));
+                    }
+                }
+                count
+            }
+            1 => {
+                let _parent = st;
+                let mut st = st;
+                if (w >> 4) & 3 != 0 {
+                    let (k, n) = self.seed_slot(o, (w >> 4) & 3, &st);
+                    st.seed = if (w >> 3) & 1 == 0 { k } else { st.seed.wrapping_add(k) } & M24;
+                    o = n;
+                }
+                if w & 0x80 != 0 {
+                    o += 4;
+                    let c0 = p.w(o) as usize;
+                    let c1 = p.w(o + 4) as usize;
+                    let e0 = if c0 != 0 { self.estimate_draws(c0, st, limit) } else { 0 };
+                    let e1 = if c1 != 0 { self.estimate_draws(c1, st, limit) } else { 0 };
+                    e0.max(e1)
+                } else {
+                    let value = (w >> 6) & 1;
+                    let child = p.w(o + 4 * value as usize) as usize;
+                    if child != 0 {
+                        self.estimate_draws(child, st, limit)
+                    } else {
+                        0
+                    }
+                }
+            }
+            3 => {
+                let parent = st;
+                let mut st = st;
+                if (w >> 4) & 3 != 0 {
+                    let (k, n) = self.seed_slot(o, (w >> 4) & 3, &st);
+                    st.seed = if (w >> 3) & 1 == 0 { k } else { st.seed.wrapping_add(k) } & M24;
+                    o = n;
+                }
+                let mut count = (w >> 8) as usize;
+                if w & 0x80 != 0 {
+                    let fst = if crate::env_once!("SDRT_CNTPARENT").is_ok() { parent } else { st };
+                    let vars_snap = self.vars.borrow().clone();
+                    count = self.eval_with(p.w(o) as usize, &fst, ITER_COUNT_LCG).as_f().max(0.0) as usize;
+                    *self.vars.borrow_mut() = vars_snap;
+                    o += 4;
+                }
+                let c1 = p.w(o) as usize;
+                let c0 = if w & 0x40 != 0 && !crate::env_once!("SDRT_OUT0LATE").is_ok() {
+                    p.w(o + 4) as usize
+                } else {
+                    0
+                };
+                let mut total = if c0 != 0 {
+                    self.estimate_draws(c0, st, limit)
+                } else {
+                    0
+                };
+                if c1 != 0 && count > 0 {
+                    let child_draws = self.estimate_draws(c1, st, limit);
+                    total = total.saturating_add(child_draws.saturating_mul(count));
+                }
+                total
+            }
+            _ => 0,
+        }
     }
 
     fn node(&mut self, off: usize, st: State) {
@@ -1403,6 +1504,9 @@ fn traverse_parallel(ctx: &mut Ctx, root_off: usize, root: State, node: usize) -
         let splice = |ctx: &mut Ctx, recs: Vec<DrawRec>| {
             for (src, index, fl, c, sz, rv, sv, op, bm, wt) in recs {
                 if let Some(d) = ctx.deferred.as_mut() {
+                    if ctx.gpu_collect && d.len() >= GPU_DRAW_LIMIT {
+                        return;
+                    }
                     d.push((src, index, fl, c, sz, rv, sv, op, bm, wt));
                 } else {
                     ctx.draw(src, index, fl, c, sz, rv, sv, &op, bm, wt);
@@ -1410,6 +1514,9 @@ fn traverse_parallel(ctx: &mut Ctx, root_off: usize, root: State, node: usize) -
             }
         };
         for win in tasks.chunks(window) {
+            if ctx.gpu_collect && ctx.deferred.as_ref().is_some_and(|d| d.len() >= GPU_DRAW_LIMIT) {
+                break;
+            }
             let per = win.len().div_ceil(nworkers).max(1);
             let chunks: Vec<&[(usize, usize, State, u32)]> = win.chunks(per).collect();
             let abort = AtomicBool::new(false);
@@ -1539,10 +1646,15 @@ enum Rendered {
 
 #[cfg(feature = "gpu")]
 pub fn prepare_gpu(rt: &mut Runtime, n: &Node, seed: u32) -> Result<GpuPlan, String> {
-    match render_inner(rt, n, seed, true) {
+    let t0 = std::time::Instant::now();
+    let res = match render_inner(rt, n, seed, true) {
         Rendered::Gpu(p) => p,
         Rendered::Cpu(_) => unreachable!(),
+    };
+    if prof() || crate::env_once!("SDRT_TIME").is_ok() {
+        eprintln!("fxnode {} prepare_gpu total: {:.3}s", n.index, t0.elapsed().as_secs_f64());
     }
+    res
 }
 
 fn render_inner(rt: &mut Runtime, n: &Node, seed: u32, gpu_collect: bool) -> Rendered {
@@ -1591,7 +1703,15 @@ fn render_inner(rt: &mut Runtime, n: &Node, seed: u32, gpu_collect: bool) -> Ren
     if gpu_collect {
         let reason = if out.color != n.color { Some("background colour differs from node") }
             else if kinds.contains(&4) { Some("Gaussian requires CPU expf") }
-            else { None };
+            else if out.px.iter().flatten().any(|x| !x.is_finite()) { Some("non-finite background") }
+            else if let Some((r, t)) = roi {
+                if r.iter().chain(t.iter()).any(|x| !x.is_finite() || x.abs() > 16.0)
+                    || r[1] - r[0] < 1.0 / 65536.0 || r[3] - r[2] < 1.0 / 65536.0 {
+                    Some("non-finite, reversed, degenerate or excessive ROI")
+                } else {
+                    None
+                }
+            } else { None };
         if let Some(why) = reason { return Rendered::Gpu(Err(why.into())); }
     }
     let ngroups = kinds.len() + has_img as usize;
@@ -1599,14 +1719,25 @@ fn render_inner(rt: &mut Runtime, n: &Node, seed: u32, gpu_collect: bool) -> Ren
     let mut ctx = Ctx { gpu_collect, deferred: if regroup || gpu_collect { Some(vec![]) } else { None }, collect: None, snaps: vec![], snap_budget: 0, spec: None, work: 0, track: None, call_depth: 0, split_at: u32::MAX, no_snap: crate::env_once!("SDRT_SNAP").is_err() && crate::env_once!("SDRT_SNAPLX").is_err() && crate::env_once!("SDRT_FXWRAPC").is_err(), rt: rtr, p: rtr.p, out, color: n.color, quantized_color, quantized_gray, max_depth: md, hurst, opmult, roi, wrap: (n.b3 & 1 != 0, n.b3 & 2 != 0), inputs: std::sync::Arc::new(inputs), input_formats, funcs: Default::default(), weights: vec![], bufs: Default::default(), vars: std::cell::RefCell::new(rtr.node_vars.clone()), unsupported: vec![] };
     ctx.weights = (0..64).map(|d| ctx.weight_calc(d)).collect();
     let root = State { depth: 0, center: [0.5, 0.5], seed: seed & M24, branch: [0.0, 0.0], number: 0.0 };
-    if gpu_collect || !traverse_parallel(&mut ctx, n.data, root, n.index) {
+    if gpu_collect && ctx.estimate_draws(n.data, root, GPU_DRAW_LIMIT) >= GPU_DRAW_LIMIT {
+        return Rendered::Gpu(Err("draw collection budget".into()));
+    }
+    let par = traverse_parallel(&mut ctx, n.data, root, n.index);
+    if crate::env_once!("SDRT_TIME").is_ok() {
+        eprintln!("fxnode {} traverse_parallel: {}", n.index, par);
+    }
+    if !par {
         ctx.node(n.data, root);
     }
     if let Some(mut d) = ctx.deferred.take() {
         let nin = ctx.inputs.len().max(1) as u32;
         if regroup { d.sort_by_key(|e| if e.0 == 2 { (1u32, if dyn_img { e.1.min(nin - 1) } else { 0 }) } else { (0, e.1) }); }
         if gpu_collect {
+            let t_plan = std::time::Instant::now();
             let plan = gpu_plan(&ctx, &d);
+            if crate::env_once!("SDRT_TIME").is_ok() {
+                eprintln!("fxnode {} gpu_plan: {:.3}s, draws: {}, result: {:?}", n.index, t_plan.elapsed().as_secs_f64(), d.len(), plan.as_ref().err());
+            }
             if plan.is_ok() {
                 for u in ctx.unsupported { rt.unsupported.push((n.index, u)); }
             }
@@ -1642,24 +1773,42 @@ fn render_inner(rt: &mut Runtime, n: &Node, seed: u32, gpu_collect: bool) -> Ren
 /// output/VM side effects; retrying halves therefore preserves every per-pixel operation.
 fn gpu_plan(ctx: &Ctx, draws: &[DrawRec]) -> Result<GpuPlan, String> {
     if draws.len() >= GPU_DRAW_LIMIT { return Err("draw collection budget".into()); }
-    fn collect(ctx: &Ctx, draws: &[DrawRec], tables: &mut Vec<Image>, total: &mut usize) -> Result<(), String> {
+    let all_len = draws.len();
+    // In Substance FX-Map, stamps occupy at least 8-12 vec4s each in the tile tables.
+    // Trees with >1.25M draws cannot fit in the 16,000,000 streamed table limit.
+    if all_len > 1_250_000 {
+        return Err("streamed tile table budget".into());
+    }
+    fn collect(ctx: &Ctx, draws: &[DrawRec], all_len: usize, tables: &mut Vec<Image>, total: &mut usize, done: &mut usize) -> Result<(), String> {
+        if draws.len() > 400_000 {
+            let mid = draws.len() / 2;
+            collect(ctx, &draws[..mid], all_len, tables, total, done)?;
+            return collect(ctx, &draws[mid..], all_len, tables, total, done);
+        }
         match gpu_plan_chunk(ctx, draws) {
             Ok(table) => {
+                *done += draws.len();
                 *total += table.px.len();
-                if *total > 16_000_000 || tables.len() >= 64 {return Err("streamed tile table budget".into());}
+                if *total > 16_000_000 || tables.len() >= 64 { return Err("streamed tile table budget".into()); }
                 tables.push(table);
+                if *done > 0 {
+                    let ratio = all_len as f64 / *done as f64;
+                    if (tables.len() as f64 * ratio) > 64.0 || (*total as f64 * ratio) > 15_200_000.0 {
+                        return Err("streamed tile table budget".into());
+                    }
+                }
                 Ok(())
             }
-            Err(e) if draws.len()>1 && (e=="tile table budget" || e=="image packing budget") => {
-                let mid=draws.len()/2;
-                collect(ctx,&draws[..mid],tables,total)?;
-                collect(ctx,&draws[mid..],tables,total)
+            Err(e) if draws.len() > 1 && (e == "tile table budget" || e == "image packing budget") => {
+                let mid = draws.len() / 2;
+                collect(ctx, &draws[..mid], all_len, tables, total, done)?;
+                collect(ctx, &draws[mid..], all_len, tables, total, done)
             }
             Err(e) => Err(e),
         }
     }
-    let mut tables=vec![];
-    collect(ctx,draws,&mut tables,&mut 0)?;
+    let mut tables = vec![];
+    collect(ctx, draws, all_len, &mut tables, &mut 0, &mut 0)?;
     Ok(GpuPlan {background:ctx.out.clone(),tables,tiles_x:ctx.out.w.div_ceil(16) as u32,
         roi:ctx.roi.map(|(r,_)|[r[0],r[2],r[1]-r[0],r[3]-r[2]])})
 }

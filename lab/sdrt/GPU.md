@@ -22,12 +22,14 @@ engine is tracked in git (`research/sbsar`, remote open-sbsar). History: `sdrt_g
 | 0x1e | levels | gpu_atomic.wgsl | exact except `pow` (mid ≠ 0.5): 20 / 28 | 276 / 283 |
 | 0x28 | pixel processor | generated (gpu_pp.rs) | suites pass; transcendentals native | control flow 229 / 234 |
 | 0x2a | distance | gpu_distance.wgsl | 1,614 / 1,614 | 330 / 330 |
-| 0x08 | FX-Map | in progress (`cx/gpu_fxmap`) | 741 / 742 (+1 FTZ), subset | 45 / 456 run on GPU |
+| 0x08 | FX-Map | gpu_fxmap.wgsl (ordered tiles) | 1,871 / 1,872 (+1 FTZ) | 789 / 789 (789 of 931 on GPU) |
 
 CPU by design: bitmaps (0x20), text (0x22), SVG (0x0a), value processors, legacy motion blur
-(0x12). GPU coverage of whole-graph renders, 45 files at 128²: 36,442 / 38,271 nodes (95.2%);
-the rest is mostly FX-Maps and value processors. Speed (`cx/gpu_perf/REPORT.md`, whole files):
-1024² 2.2–13.4× faster than the CPU path, 2048² 1.4–14.8×; FX-Maps (CPU) dominate what remains.
+(0x12). FX-Map fallbacks left: the Gaussian pattern (libm `expf`), degenerate ROIs, streamed
+tile-table budget. GPU coverage of whole-graph renders, 45 files at 128²: 36,442 / 38,271 nodes (95.2%);
+the rest is mostly FX-Maps and value processors. Speed, whole files at 1024² (CPU / Vulkan wall time): clay_bricks 102 / 1.8 s, dirtyconcrete
+93 / 8.2 s, biscuitrooftiles 40 / 3.4 s, cracks-cliff 21 / 7.0 s, asphaltsubstance001 61 / 49 s
+(`cx/gpu_perf`, `cx/gpu_fxperf` reports).
 Whole-graph GPU renders equal the CPU's byte for byte on most outputs (green-mosaic at 512²:
 17 of 22 outputs; the others differ by ≤ 9/65535 on < 0.1% of pixels, from PP transcendentals).
 
@@ -181,8 +183,8 @@ creation time is large static shaders whose ~100 `sample_image` calls are each i
 
 ## Next work
 
-1. FX-Maps on the GPU beyond the current subset (rotation, every pattern kind, image patterns,
-   arbitrary sizes, streamed draw lists): `cx/gpu_fxmap/TASK2.md`, in progress.
+1. FX-Maps: the Gaussian pattern needs a bit-exact `expf` on the GPU (glibc evaluates in double:
+   `SHADER_F64` or an emulation); FX-Map-heavy files are now only ~1.3× faster than the CPU.
 2. Exact `pow` and the PP transcendentals, or a measured decision to keep the GPU's own
    functions where they match Substance's GPU engine better (compare against the 14.1 vk cache).
 3. Large verification campaigns on the GPU (full cached survey, writer round trips).
