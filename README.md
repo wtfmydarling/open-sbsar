@@ -20,9 +20,9 @@ binaries or resources was used at any point.
 | Path | What |
 | --- | --- |
 | `lab/sdrt/` | `sdrt`, the engine (Rust): container and program parser, node operations, the function VM, FX-Maps, text, bitmaps; CPU reference path and an optional Vulkan (wgpu) backend |
-| `lab/sdrt/GPU.md` | state of the Vulkan backend: what runs on the GPU, how bit-exactness with the CPU path is kept, limits |
+| `lab/sdrt/GPU.md` | state of the Vulkan backend: what runs on the GPU, how bit-exactness with the CPU path is kept, limits (a research log: it refers to test scripts that are not part of this repository) |
 | `tools/write.py` | writes `.sbsar` files from scratch (Python 3, standard library; needs `7z`) |
-| `docs/` | the format specification (in progress) |
+| `docs/` | the format specification, draft 1: [SPEC.md](docs/SPEC.md) (container, program binary, execution model), [SPEC-vm.md](docs/SPEC-vm.md) (functions), [SPEC-ops.md](docs/SPEC-ops.md) (node operations), [SPEC-fxmap.md](docs/SPEC-fxmap.md) (FX-Maps, text, SVG, bitmaps) |
 
 ## Accuracy
 
@@ -32,6 +32,11 @@ identical, and of 1,575 outputs
 1,135 within 1/255, 156 within 0.02, 284 further off. Most of the remaining differences are
 floating-point noise that Substance's own CPU and GPU engines also disagree on, amplified by
 noise/threshold chains; matching its GPU engine exactly is the purpose of the Vulkan backend.
+
+The Vulkan backend (`--features gpu`, `--backend vulkan`) runs about 95% of the nodes of real
+graphs on the GPU and reproduces the CPU path bit for bit, except where it deliberately uses the
+GPU's own transcendental functions (pixel processors, levels' gamma), which measure closer to
+Substance's own GPU engine. Whole files at 1024² render 1.3–56× faster than on the CPU path.
 
 ## Build and run
 
@@ -54,4 +59,8 @@ sdrt stats FILE.sbsar                    # every node: op, size, value ranges
 
 ## License
 
-To be decided by the project owner before the first public release.
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+See [NOTICE](NOTICE) for the clean-room statement, trademarks and acknowledgements.
+
+Unless you explicitly state otherwise, any contribution you submit for inclusion in this work
+shall be dual licensed as above, without any additional terms or conditions.
