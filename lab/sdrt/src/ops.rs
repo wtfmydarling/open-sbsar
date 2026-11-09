@@ -431,8 +431,7 @@ impl<'p> Runtime<'p> {
             if !resident {
                 #[cfg(feature="gpu")]
                 {
-                    for &k in &node.inputs { self.materialize(k); }
-                    for (_,slot) in &node.params { if let Slot::Input(k)=slot { self.materialize(*k); } }
+                    self.materialize_for_node(&node);
                 }
                 let mut img=self.exec(&node);
                 img.quantize(node.format());
@@ -467,6 +466,10 @@ impl<'p> Runtime<'p> {
                     }
                 }
             }
+        }
+        #[cfg(feature="gpu")]
+        if let Some(gpu) = &mut self.gpu {
+            gpu.flush();
         }
     }
 
@@ -1506,6 +1509,53 @@ impl<'p> Runtime<'p> {
     }
 
     #[cfg(feature = "gpu")]
+    fn materialize_for_node(&mut self, node: &Node) {
+        match node.op {
+            0x0C | 0x20 | 0x0A | 0x22 => {} // no inputs read by uniform color, bitmap, svg, text
+            0x04 | 0x00 | 0x14 | 0x16 | 0x12 | 0x1A | 0x1C | 0x1E | 0x24 => {
+                if let Some(&k) = node.inputs.get(0) { self.materialize(k); }
+            }
+            0x06 => {
+                if node.color {
+                    for &k in node.inputs.iter().take(2) { self.materialize(k); }
+                } else if let Some(&k) = node.inputs.get(0) {
+                    self.materialize(k);
+                }
+            }
+            0x02 => {
+                for &k in node.inputs.iter().take(2) { self.materialize(k); }
+                if let Slot::Input(k) = node.param("opacity") { self.materialize(*k); }
+            }
+            0x0E | 0x18 | 0x26 | 0x2A | 0x10 => {
+                for &k in node.inputs.iter().take(2) { self.materialize(k); }
+            }
+            0x2C => {
+                let along_x = node.flags & 1 != 0;
+                if !along_x {
+                    if let Some(&k) = node.inputs.get(0) { self.materialize(k); }
+                }
+            }
+            0x28 => {
+                let f = self.func(node.data);
+                for i in &f.ins {
+                    if i.op == 51 || i.op == 52 {
+                        let slot = i.ops[1] as usize;
+                        if let Some(&k) = node.inputs.get(slot) {
+                            self.materialize(k);
+                        }
+                    }
+                }
+            }
+            _ => {
+                for &k in &node.inputs { self.materialize(k); }
+                for (_, slot) in &node.params {
+                    if let Slot::Input(k) = slot { self.materialize(*k); }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
     fn materialize(&mut self, k: usize) {
         if k >= self.images.len() || self.images[k].is_some() {
             return;
@@ -1549,6 +1599,23 @@ impl<'p> Runtime<'p> {
                     eprintln!("GPU PP node {}: CPU fallback (input exceeds one GPU storage binding)", n.index);
                 }
                 return false;
+            }
+            if n.inputs.len() > 2 {
+                let g = self.gpu.as_ref().unwrap();
+                let mut total = 0u64;
+                for &k in &n.inputs {
+                    if k < self.p.nodes.len() {
+                        if let Some((sw, sh)) = g.size(k).or_else(|| self.images.get(k).and_then(|i| i.as_ref()).map(|im| (im.w, im.h))) {
+                            total += (sw * sh * 16) as u64;
+                        }
+                    }
+                }
+                if total.max(16) > g.limits().max_storage_buffer_binding_size as u64 {
+                    if crate::envc::var("SDRT_GPU_LOG").is_ok() {
+                        eprintln!("GPU PP node {}: CPU fallback (packed inputs exceed GPU binding size limit)", n.index);
+                    }
+                    return false;
+                }
             }
             let f = self.func(n.data);
             crate::gpu_pp::NODE.with(|c| c.set(n.index));
@@ -1643,6 +1710,13 @@ impl<'p> Runtime<'p> {
                 }
                 return false;
             } // Atomic-node resize retains the CPU resampling path.
+        }
+        if image_inputs.len() > 2 {
+            let g = self.gpu.as_ref().unwrap();
+            let total = (image_inputs.len() as u64) * (w as u64) * (h as u64) * 16;
+            if total > g.limits().max_storage_buffer_binding_size as u64 {
+                return false;
+            }
         }
         self.cur_size = [w as f32, h as f32];
         let seed = self.seed(n);
@@ -3492,7 +3566,7 @@ impl<'p> Runtime<'p> {
         if n.flags >> 16 != 0 {
             // value processor: one evaluation, read by others with op 3
             let mut vars = std::mem::take(&mut self.node_vars);
-            let srcs: Vec<std::sync::Arc<Image>> = n.inputs.iter().filter_map(|&k| if k < self.images.len() { self.images[k].clone() } else { Some(std::sync::Arc::new(Image::new(1, 1, true, [0.0; 4]))) }).collect();
+            let srcs: Vec<std::sync::Arc<Image>> = n.inputs.iter().filter_map(|&k| if k < self.images.len() { self.images[k].clone().or_else(|| Some(std::sync::Arc::new(Image::new(1, 1, true, [0.0; 4])))) } else { Some(std::sync::Arc::new(Image::new(1, 1, true, [0.0; 4]))) }).collect();
             let fmts: Vec<u32> = n.inputs.iter().map(|&k| if k < self.p.nodes.len() { self.tex_format(k) } else { 3 }).collect();
             if crate::envc::var("SDRT_VPLOG").is_ok() { eprintln!("vp {} inputs {:?} present {:?}", n.index, n.inputs, n.inputs.iter().map(|&k| self.images.get(k).is_some_and(|i| i.is_some())).collect::<Vec<_>>()); }
             let old = crate::env_once!("SDRT_VPRAND").as_deref() == Ok("node");
@@ -3510,7 +3584,7 @@ impl<'p> Runtime<'p> {
             self.vp.insert(n.index, v);
             return Image::new(1, 1, n.color, [0.0; 4]);
         }
-        let srcs: Vec<std::sync::Arc<Image>> = n.inputs.iter().map(|&k| if k < self.images.len() { self.images[k].clone().expect("input computed") } else { std::sync::Arc::new(Image::new(1, 1, true, [0.0; 4])) }).collect();
+        let srcs: Vec<std::sync::Arc<Image>> = n.inputs.iter().map(|&k| if k < self.images.len() { self.images[k].clone().unwrap_or_else(|| std::sync::Arc::new(Image::new(1, 1, true, [0.0; 4]))) } else { std::sync::Arc::new(Image::new(1, 1, true, [0.0; 4])) }).collect();
         let node_vars = self.node_vars.clone();
         let refs: Vec<&Image> = srcs.iter().map(|a| a.as_ref()).collect();
         let fmts: Vec<u32> = n.inputs.iter().map(|&k| if k < self.p.nodes.len() { self.tex_format(k) } else { 3 }).collect();
