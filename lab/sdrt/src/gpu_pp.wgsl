@@ -33,7 +33,7 @@ fn float_mod(a:f32,b:f32)->f32 {
     if b==0.0 {return a;}
     return a-b*floor(a/b);
 }
-fn pp_sqrt(x:f32)->f32 {if x<=0.0 {return 0.0;} return sqrt(x);}
+fn pp_sqrt(x:f32)->f32 {if x<=0.0 {return 0.0;} return sqrt_rn(x);}
 fn pp_pow(a:f32,b:f32)->f32 {
     let an=(bitcast<u32>(a)&0x7fffffffu)>0x7f800000u;
     let bn=(bitcast<u32>(b)&0x7fffffffu)>0x7f800000u;
@@ -95,27 +95,35 @@ fn sample_image(slot:u32,uv:vec2<f32>,sample_mode:u32,color:bool)->vec4<f32> {
             if desc.z<=1u {return vec4<f32>(0.0);}
             return vec4<f32>(bitcast<f32>(0x7fc00000u));
         }
-        let xy=uv*vec2<f32>(desc.xy)-vec2<f32>(0.5);let base=floor(xy);
-        // Positive fractional parts, round ties up (WGSL round would use ties-to-even).
-        let f=vec2<u32>(floor((xy-base)*256.0+vec2<f32>(0.5)));
-        let cross=(f.x*f.y+128u)>>8u;
-        let weights=vec4<u32>(256u-f.x-f.y+cross,f.x-cross,f.y-cross,cross);
+        let x=barrier(uv.x*f32(desc.x))-0.5;
+        let y=barrier(uv.y*f32(desc.y))-0.5;
+        let x0=floor(x);
+        let y0=floor(y);
+        let base=vec2<f32>(x0,y0);
+        let fx=rs_round((x-x0)*256.0)*(1.0/256.0);
+        let fy=rs_round((y-y0)*256.0)*(1.0/256.0);
+        let cross=rs_round(fx*fy*256.0)*(1.0/256.0);
+        let wt=vec4<f32>(1.0-fx-fy+cross,fx-cross,fy-cross,cross);
         let a=texel(slot,base,desc.xy,clamp_edges);
         let b=texel(slot,base+vec2<f32>(1.0,0.0),desc.xy,clamp_edges);
         let c=texel(slot,base+vec2<f32>(0.0,1.0),desc.xy,clamp_edges);
         let d=texel(slot,base+vec2<f32>(1.0,1.0),desc.xy,clamp_edges);
         if desc.z<=1u {
-            let sum=vec4<u32>(floor(a*65535.0+vec4<f32>(0.5)))*weights.x+
-                    vec4<u32>(floor(b*65535.0+vec4<f32>(0.5)))*weights.y+
-                    vec4<u32>(floor(c*65535.0+vec4<f32>(0.5)))*weights.z+
-                    vec4<u32>(floor(d*65535.0+vec4<f32>(0.5)))*weights.w;
+            let wq=vec4<u32>(u32(rs_round(wt.x*256.0)),u32(rs_round(wt.y*256.0)),u32(rs_round(wt.z*256.0)),u32(rs_round(wt.w*256.0)));
+            let sum=vec4<u32>(unorm16_code(a.x),unorm16_code(a.y),unorm16_code(a.z),unorm16_code(a.w))*wq.x+
+                    vec4<u32>(unorm16_code(b.x),unorm16_code(b.y),unorm16_code(b.z),unorm16_code(b.w))*wq.y+
+                    vec4<u32>(unorm16_code(c.x),unorm16_code(c.y),unorm16_code(c.z),unorm16_code(c.w))*wq.z+
+                    vec4<u32>(unorm16_code(d.x),unorm16_code(d.y),unorm16_code(d.z),unorm16_code(d.w))*wq.w;
             let q=(sum+vec4<u32>(128u))>>vec4<u32>(8u);
             p=vec4<f32>(unorm_float(q.x,16u),unorm_float(q.y,16u),unorm_float(q.z,16u),unorm_float(q.w,16u));
         } else {
-            let wt=vec4<f32>(weights)*(1.0/256.0);
-            p=((a*wt.x+b*wt.y)+c*wt.z)+d*wt.w;
+            var o=barrier4(a*wt.x);
+            o=o+barrier4(b*wt.y);
+            o=o+barrier4(c*wt.z);
+            o=o+barrier4(d*wt.w);
+            p=o;
         }
     }
-    if !color && desc.w!=0u {let g=((p.x+p.y)+p.z)/3.0;return vec4<f32>(g,g,g,1.0);}
+    if !color && desc.w!=0u {let g=div_rn(barrier(p.x+p.y)+p.z,3.0);return vec4<f32>(g,g,g,1.0);}
     return p;
 }

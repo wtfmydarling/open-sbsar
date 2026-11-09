@@ -25,6 +25,12 @@ name = "gpu_fma"
 path = "src/bin/gpu_fma.rs"
 required-features = ["gpu"]
 
+# research probe: the prelude's correctly rounded helpers against the CPU's
+[[bin]]
+name = "gpu_exact_probe"
+path = "src/bin/gpu_exact_probe.rs"
+required-features = ["gpu"]
+
 [dependencies.wgpu]
 version = "0.19.4"
 optional = true

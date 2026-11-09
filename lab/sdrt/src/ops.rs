@@ -1531,6 +1531,10 @@ impl<'p> Runtime<'p> {
         }
         if (n.op==0x02 && ["SDRT_MIX","SDRT_DIVNAN"].iter().any(|s|crate::envc::var(s).is_ok()))
             || (n.op==0x1e && crate::envc::var("SDRT_LVPCLAMP").as_deref()==Ok("0")) {
+            if crate::envc::var("SDRT_GPU_LOG").is_ok() {
+                let kern = if n.op == 0x02 { "blend" } else { "levels" };
+                eprintln!("GPU {kern} node {}: CPU fallback (switch disabled)", n.index);
+            }
             return false;
         }
         if n.op == 0x28 && n.flags >> 16 == 0 {
@@ -1621,12 +1625,22 @@ impl<'p> Runtime<'p> {
         if !matches!(n.op, 0x0c | 0x06 | 0x02 | 0x1e | 0x24 | 0x1a) {
             return false;
         }
+        let kern = match n.op {
+            0x02 => "blend",
+            0x1e => "levels",
+            0x24 => "normal",
+            0x1a => "sharpen",
+            _ => "atomic",
+        };
         let (w, h) = n.size();
         let mut image_inputs=n.inputs.clone();
         if n.op==0x02 {if let Slot::Input(k)=n.param("opacity") {image_inputs.push(*k);}}
         for &k in &image_inputs {
             let size = self.gpu.as_ref().unwrap().size(k).or_else(|| self.images.get(k).and_then(|i| i.as_ref()).map(|im| (im.w, im.h)));
             if size != Some((w, h)) {
+                if crate::envc::var("SDRT_GPU_LOG").is_ok() {
+                    eprintln!("GPU {kern} node {}: CPU fallback (input size mismatch)", n.index);
+                }
                 return false;
             } // Atomic-node resize retains the CPU resampling path.
         }
@@ -1720,6 +1734,9 @@ impl<'p> Runtime<'p> {
             }
         }
         gpu.dispatch(n.index, w, h, n.color, n.format(), &config, a, b, None, &sources).expect("Vulkan dispatch failed");
+        if crate::envc::var("SDRT_GPU_LOG").is_ok() {
+            eprintln!("GPU {kern} node {}: shader {w}x{h}", n.index);
+        }
         self.images[n.index] = None;
         true
     }

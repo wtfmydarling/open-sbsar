@@ -12,9 +12,6 @@
 // Every product that feeds an addition goes through barrier()/barrier4(), so each multiply and
 // add rounds on its own as on the CPU.
 
-fn barrier4(p: vec4<f32>) -> vec4<f32> {
-    return bitcast<vec4<f32>>(bitcast<vec4<u32>>(p) ^ vec4<u32>(config.header.y >> 31u));
-}
 
 // The CPU's 0.0 accumulator start (0.0 + -0.0 is +0.0): a zero the compiler cannot fold away.
 fn s_zero4() -> vec4<f32> {
