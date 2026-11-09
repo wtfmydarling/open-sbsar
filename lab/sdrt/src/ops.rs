@@ -1568,6 +1568,55 @@ impl<'p> Runtime<'p> {
     }
 
     #[cfg(feature = "gpu")]
+    fn try_gpu_fxmap(&mut self, n: &Node) -> bool {
+        use crate::gpu::{Pass, Src};
+        let log = crate::envc::var("SDRT_GPU_LOG").is_ok();
+        let fallback = |why: &str| {
+            if log { eprintln!("GPU fxmap node {}: CPU fallback ({why})", n.index); }
+            false
+        };
+        let switches = ["SDRT_COVER", "SDRT_LX64", "SDRT_SNAP", "SDRT_SBSROT", "SDRT_NEARMIP",
+            "SDRT_SWPARENT", "SDRT_CNTPARENT", "SDRT_OUT0LATE", "SDRT_ITERREV", "SDRT_CORDER", "SDRT_PIXDBG", "SDRT_LIBMTRIG"];
+        if std::env::vars_os().any(|(k,_)| {
+            let k=k.to_string_lossy();
+            (k.starts_with("SDRT_FX") && k!="SDRT_FXPROF" && k!="SDRT_FXPARDBG") || switches.iter().any(|s|k.starts_with(s))
+        }) { return fallback("FX-Map experiment switch"); }
+        let (w,h)=n.size();
+        if !self.gpu.as_ref().unwrap().fits(w,h) { return fallback("output exceeds GPU binding"); }
+        for &k in &n.inputs { self.materialize(k); }
+        for (_,slot) in &n.params { if let Slot::Input(k)=slot { self.materialize(*k); } }
+        let vars=self.node_vars.clone();
+        self.cur_size=[w as f32,h as f32];
+        let seed=self.seed(n);
+        let plan=match crate::fxmap::prepare_gpu(self,n,seed) {
+            Ok(p)=>p,
+            Err(why)=> {self.node_vars=vars; return fallback(&why);}
+        };
+        let g=self.gpu.as_mut().unwrap();
+        // Two temporary uploads share the existing image-buffer mechanism. The background
+        // retains the CPU's resize and initial quantization semantics.
+        const BG:usize=usize::MAX-1;
+        g.release(BG); g.release(GPU_TABLE);
+        g.upload(BG,&plan.background).expect("FX-Map background upload failed");
+        let chunks=plan.tables.len();
+        for (i,table) in plan.tables.iter().enumerate() {
+            g.release(GPU_TABLE);
+            g.upload(GPU_TABLE,table).expect("FX-Map table upload failed");
+            let mut config=[0u32;40]; config[12]=plan.tiles_x; config[13]=n.format();
+            if let Some(roi)=plan.roi {config[0]=1;for (j,v) in roi.iter().enumerate() {config[20+j]=v.to_bits();}}
+            // Per-layer UNORM8 still uses the original format. Every intermediate
+            // result is stored as f32; half truncation/final quantization run once.
+            let pass=Pass {config,w,h,color:n.color,format:if i+1==chunks {n.format()} else {3},
+                a:Src::Node(if i==0 {BG} else {n.index}),b:Src::Node(GPU_TABLE)};
+            g.dispatch_passes(n.index,("fxmap",concat!(include_str!("gpu_color_common.wgsl"),include_str!("gpu_fxmap.wgsl"))),&[pass]).expect("Vulkan FX-Map dispatch failed");
+        }
+        g.release(BG); g.release(GPU_TABLE);
+        self.images[n.index]=None;
+        if log {eprintln!("GPU fxmap node {}: shader ordered-tiles chunks={chunks}",n.index);}
+        true
+    }
+
+    #[cfg(feature = "gpu")]
     fn try_gpu(&mut self, n: &Node) -> bool {
         if self.gpu.is_none() {
             return false;
@@ -1677,6 +1726,7 @@ impl<'p> Runtime<'p> {
             // try_gpu_transform logs its own fallback reasons.
             return self.try_gpu_transform(n);
         }
+        if n.op == 0x08 { return self.try_gpu_fxmap(n); }
         // The filter ports log their own fallback reasons too.
         if n.op == 0x0E { return self.try_gpu_warp(n); }
         if n.op == 0x18 { return self.try_gpu_dirwarp(n); }

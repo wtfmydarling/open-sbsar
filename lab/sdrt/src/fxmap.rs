@@ -430,6 +430,8 @@ fn pattern(kind: u32, u: f32, v: f32, suppl: f32) -> f32 {
     }
 }
 
+const GPU_DRAW_LIMIT: usize = 2_097_152;
+
 #[allow(clippy::type_complexity)]
 /// A recorded draw: src, index, image flags, centre, size, rotation, suppl, opacity, max blend,
 /// weight.
@@ -443,6 +445,7 @@ enum Item {
 }
 
 struct Ctx<'a> {
+    gpu_collect: bool,
     deferred: Option<Vec<DrawRec>>,
     /// Parallel traversal (see `render`): draws and subtrees past `split_at` node calls are
     /// recorded here instead of drawn / entered.
@@ -636,6 +639,7 @@ impl<'a> Ctx<'a> {
     /// variables (a copy), draws recorded.
     fn worker(&self) -> Ctx<'a> {
         Ctx {
+            gpu_collect: false,
             deferred: Some(vec![]),
             collect: None,
             snaps: vec![],
@@ -677,6 +681,9 @@ impl<'a> Ctx<'a> {
     }
 
     fn node(&mut self, off: usize, st: State) {
+        if self.gpu_collect && self.deferred.as_ref().is_some_and(|d| d.len() >= GPU_DRAW_LIMIT) {
+            return;
+        }
         if self.collect.is_some() && self.snap_budget == 0 {
             return;
         }
@@ -1512,6 +1519,33 @@ fn traverse_parallel(ctx: &mut Ctx, root_off: usize, root: State, node: usize) -
 }
 
 pub fn render(rt: &mut Runtime, n: &Node, seed: u32) -> Image {
+    match render_inner(rt, n, seed, false) {
+        Rendered::Cpu(im) => im,
+        Rendered::Gpu(_) => unreachable!(),
+    }
+}
+
+pub struct GpuPlan {
+    pub background: Image,
+    pub tables: Vec<Image>,
+    pub tiles_x: u32,
+    pub roi: Option<[f32; 4]>,
+}
+
+enum Rendered {
+    Cpu(Image),
+    Gpu(Result<GpuPlan, String>),
+}
+
+#[cfg(feature = "gpu")]
+pub fn prepare_gpu(rt: &mut Runtime, n: &Node, seed: u32) -> Result<GpuPlan, String> {
+    match render_inner(rt, n, seed, true) {
+        Rendered::Gpu(p) => p,
+        Rendered::Cpu(_) => unreachable!(),
+    }
+}
+
+fn render_inner(rt: &mut Runtime, n: &Node, seed: u32, gpu_collect: bool) -> Rendered {
     let t_render = std::time::Instant::now();
     let (d0, n0, s0) = (PROF_DRAW_NS.load(std::sync::atomic::Ordering::Relaxed), PROF_DRAWS.load(std::sync::atomic::Ordering::Relaxed), PROF_SPLATS.load(std::sync::atomic::Ordering::Relaxed));
     if crate::env_once!("SDRT_FXLOG").is_ok() {
@@ -1554,17 +1588,30 @@ pub fn render(rt: &mut Runtime, n: &Node, seed: u32) -> Image {
     let mut acc = (std::collections::BTreeSet::new(), false, false);
     scan_groups(rt.p, n.data, &mut std::collections::HashSet::new(), &mut acc);
     let (kinds, has_img, dyn_img) = acc;
+    if gpu_collect {
+        let reason = if out.color != n.color { Some("background colour differs from node") }
+            else if kinds.contains(&4) { Some("Gaussian requires CPU expf") }
+            else { None };
+        if let Some(why) = reason { return Rendered::Gpu(Err(why.into())); }
+    }
     let ngroups = kinds.len() + has_img as usize;
     let regroup = crate::env_once!("SDRT_FXORDER").as_deref() != Ok("trav") && (ngroups > 1 || dyn_img);
-    let mut ctx = Ctx { deferred: if regroup { Some(vec![]) } else { None }, collect: None, snaps: vec![], snap_budget: 0, spec: None, work: 0, track: None, call_depth: 0, split_at: u32::MAX, no_snap: crate::env_once!("SDRT_SNAP").is_err() && crate::env_once!("SDRT_SNAPLX").is_err() && crate::env_once!("SDRT_FXWRAPC").is_err(), rt: rtr, p: rtr.p, out, color: n.color, quantized_color, quantized_gray, max_depth: md, hurst, opmult, roi, wrap: (n.b3 & 1 != 0, n.b3 & 2 != 0), inputs: std::sync::Arc::new(inputs), input_formats, funcs: Default::default(), weights: vec![], bufs: Default::default(), vars: std::cell::RefCell::new(rtr.node_vars.clone()), unsupported: vec![] };
+    let mut ctx = Ctx { gpu_collect, deferred: if regroup || gpu_collect { Some(vec![]) } else { None }, collect: None, snaps: vec![], snap_budget: 0, spec: None, work: 0, track: None, call_depth: 0, split_at: u32::MAX, no_snap: crate::env_once!("SDRT_SNAP").is_err() && crate::env_once!("SDRT_SNAPLX").is_err() && crate::env_once!("SDRT_FXWRAPC").is_err(), rt: rtr, p: rtr.p, out, color: n.color, quantized_color, quantized_gray, max_depth: md, hurst, opmult, roi, wrap: (n.b3 & 1 != 0, n.b3 & 2 != 0), inputs: std::sync::Arc::new(inputs), input_formats, funcs: Default::default(), weights: vec![], bufs: Default::default(), vars: std::cell::RefCell::new(rtr.node_vars.clone()), unsupported: vec![] };
     ctx.weights = (0..64).map(|d| ctx.weight_calc(d)).collect();
     let root = State { depth: 0, center: [0.5, 0.5], seed: seed & M24, branch: [0.0, 0.0], number: 0.0 };
-    if !traverse_parallel(&mut ctx, n.data, root, n.index) {
+    if gpu_collect || !traverse_parallel(&mut ctx, n.data, root, n.index) {
         ctx.node(n.data, root);
     }
     if let Some(mut d) = ctx.deferred.take() {
         let nin = ctx.inputs.len().max(1) as u32;
-        d.sort_by_key(|e| if e.0 == 2 { (1u32, if dyn_img { e.1.min(nin - 1) } else { 0 }) } else { (0, e.1) });
+        if regroup { d.sort_by_key(|e| if e.0 == 2 { (1u32, if dyn_img { e.1.min(nin - 1) } else { 0 }) } else { (0, e.1) }); }
+        if gpu_collect {
+            let plan = gpu_plan(&ctx, &d);
+            if plan.is_ok() {
+                for u in ctx.unsupported { rt.unsupported.push((n.index, u)); }
+            }
+            return Rendered::Gpu(plan);
+        }
         for (src, index, fl, c, sz, rv, sv, op, bm, wt) in d {
             ctx.draw(src, index, fl, c, sz, rv, sv, &op, bm, wt);
         }
@@ -1588,5 +1635,218 @@ pub fn render(rt: &mut Runtime, n: &Node, seed: u32) -> Image {
             (PROF_DRAW_NS.load(o) - d0) as f64 * 1e-9, PROF_DRAWS.load(o) - n0, PROF_SPLATS.load(o) - s0,
             PROF_EVALS.load(o), PROF_EVAL_NS.load(o) as f64 * 1e-9, PROF_INS.load(o));
     }
-    out
+    Rendered::Cpu(out)
+}
+
+/// Partition only the already ordered draw list. A failed planning attempt has no
+/// output/VM side effects; retrying halves therefore preserves every per-pixel operation.
+fn gpu_plan(ctx: &Ctx, draws: &[DrawRec]) -> Result<GpuPlan, String> {
+    if draws.len() >= GPU_DRAW_LIMIT { return Err("draw collection budget".into()); }
+    fn collect(ctx: &Ctx, draws: &[DrawRec], tables: &mut Vec<Image>, total: &mut usize) -> Result<(), String> {
+        match gpu_plan_chunk(ctx, draws) {
+            Ok(table) => {
+                *total += table.px.len();
+                if *total > 16_000_000 || tables.len() >= 64 {return Err("streamed tile table budget".into());}
+                tables.push(table);
+                Ok(())
+            }
+            Err(e) if draws.len()>1 && (e=="tile table budget" || e=="image packing budget") => {
+                let mid=draws.len()/2;
+                collect(ctx,&draws[..mid],tables,total)?;
+                collect(ctx,&draws[mid..],tables,total)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    let mut tables=vec![];
+    collect(ctx,draws,&mut tables,&mut 0)?;
+    Ok(GpuPlan {background:ctx.out.clone(),tables,tiles_x:ctx.out.w.div_ceil(16) as u32,
+        roi:ctx.roi.map(|(r,_)|[r[0],r[2],r[1]-r[0],r[3]-r[2]])})
+}
+
+/// Exact CPU f64 coverage as rectangles plus rotated row intervals. Pixel sampling
+/// and ordered blending run on the GPU. Each packed table is below a storage binding.
+fn gpu_plan_chunk(ctx: &Ctx, draws: &[DrawRec]) -> Result<Image, String> {
+    if ctx.out.px.iter().flatten().any(|x| !x.is_finite()) { return Err("non-finite background".into()); }
+    if let Some((r,t))=ctx.roi {
+        if r.iter().chain(t.iter()).any(|x| !x.is_finite() || x.abs()>16.0)
+            || r[1]-r[0]<1.0/65536.0 || r[3]-r[2]<1.0/65536.0 {
+            return Err("non-finite, reversed, degenerate or excessive ROI".into());
+        }
+    }
+    let (w,h)=(ctx.out.w,ctx.out.h);
+    let (tx,ty)=(w.div_ceil(16),h.div_ceil(16));
+    let mut bins=vec![Vec::<u32>::new();tx*ty];
+    let mut table=vec![[0.0;4];tx*ty];
+    let mut references=0usize;
+    let words=|v:[u32;4]| v.map(f32::from_bits);
+    let mut packed=std::collections::HashMap::new();
+    for &(src,kind,image_flags,c,sz,rot,suppl,op,bm,weight) in draws {
+        if !c.iter().chain(sz.iter()).all(|x|x.is_finite()) || sz.contains(&0.0) || !rot.is_finite() { continue; }
+        if !matches!(src,1|2) || (src==1 && kind==4) { return Err("unsupported pattern".into()); }
+        if src==2 && ctx.inputs.is_empty() {continue;}
+        if c.iter().any(|x|x.abs()>16384.0) || sz.iter().any(|x|x.abs()>64.0 || x.abs()<2.0f32.powi(-30)) {
+            return Err("stamp size or centre exceeds finite geometry budget".into());
+        }
+        if op.iter().chain([&suppl,&weight]).any(|x| !x.is_finite() || x.abs()>65536.0) {
+            return Err("non-finite or excessive opacity/supplement/weight".into());
+        }
+        let mut image_desc=[0u32;4];
+        if src==2 {
+            let index=(kind as usize).min(ctx.inputs.len()-1);
+            let chain=&ctx.inputs[index];
+            let filter=(image_flags>>2)&3;
+            // Same f32 LOD calculation as draw_inner; mip construction and VM samplers
+            // are shared with the CPU path. Experimental LOD modes are rejected by ops.
+            let level=if filter==0 {
+                let img=&chain[0];
+                let scale=ctx.roi.map_or(1.0,|(r,_)|(r[1]-r[0]).abs().max((r[3]-r[2]).abs()));
+                let tx=img.w as f32/(sz[0].abs()/scale*w as f32);
+                let ty=img.h as f32/(sz[1].abs()/scale*h as f32);
+                let a=-rot*std::f32::consts::TAU;
+                let (c,s)=(a.cos().abs(),a.sin().abs());
+                let cols=hw_len(c*tx,s*ty).max(hw_len(s*tx,c*ty));
+                let t=tx.max(ty);
+                let rows=hw_len(c*t,s*t);
+                let texels=cols+row_blend(c.min(s).atan2(c.max(s)))*(rows-cols);
+                (texels.log2().round().max(0.0) as usize).min(chain.len()-1)
+            } else {0};
+            let img=&chain[level];
+            let offset=if let Some(&offset)=packed.get(&(index,level)) {offset} else {
+                if table.len()+references+img.px.len()>4_000_000 {return Err("image packing budget".into());}
+                if img.px.iter().flatten().any(|x|!x.is_finite() || x.abs()>65536.0) {
+                    return Err("non-finite or excessive image texel".into());
+                }
+                let offset=table.len() as u32;
+                table.extend(img.px.iter().map(|p|if img.color {*p} else {Image::gray(p[0])}));
+                packed.insert((index,level),offset);
+                offset
+            };
+            image_desc=[offset,img.w as u32,img.h as u32,ctx.input_formats[index]|((img.color as u32)<<4)|(filter<<8)];
+        }
+        let cov=Cover::new(rot,sz);
+        let ext=sz[0].abs().max(sz[1].abs())*0.7072;
+        let mut append=|bounds:[usize;4],center:[f32;2],ox:i64,oy:i64| -> Result<(),String> {
+            let [l,r,t,b]=bounds;
+            let offset=table.len() as u32;
+            table.extend([words([l as u32,r as u32,t as u32,b as u32]),
+                [center[0],center[1],sz[0]/2.0,sz[1]/2.0],words([ox as u32,oy as u32,if src==2 {16} else {kind},u32::from(bm)]),
+                [op[0],op.get(1).copied().unwrap_or(0.0),op.get(2).copied().unwrap_or(0.0),op.get(3).copied().unwrap_or(1.0)],
+                [weight,suppl,(-rot*std::f32::consts::TAU).sin(),(-rot*std::f32::consts::TAU).cos()],
+                words([0,0,0,0]),words(image_desc)]);
+            if rot != 0.0 {
+                // WGSL has no f64. Keep the exact CPU coverage predicates on the host,
+                // intersecting their monotonic x intervals once per row. Sampling and
+                // all ordered blending stay on the GPU.
+                table[offset as usize+5]=words([table.len() as u32,1,0,0]);
+                for y in t..=b {
+                    let point=|x:usize| {
+                        if let Some((r,_))=ctx.roi {
+                            (r[0] as f64+(x as f64+0.5)/w as f64*(r[1]-r[0]) as f64-center[0] as f64,
+                             r[2] as f64+(y as f64+0.5)/h as f64*(r[3]-r[2]) as f64-center[1] as f64)
+                        } else {
+                            (((x as i64+ox) as f64+0.5)/w as f64-center[0] as f64,
+                             ((y as i64+oy) as f64+0.5)/h as f64-center[1] as f64)
+                        }
+                    };
+                    let lower=|pred:&dyn Fn(usize)->bool| {
+                        let (mut lo,mut hi)=(l,r+1);
+                        while lo<hi {let m=(lo+hi)/2;if pred(m) {hi=m;} else {lo=m+1;}}
+                        lo
+                    };
+                    let (mut lo,mut end)=(l,r+1);
+                    for axis in 0..2 {
+                        let slope=if axis==0 {cov.ca/cov.hx} else {cov.sa/cov.hy};
+                        let value=|x| {let (dx,dy)=point(x);
+                            let v=if axis==0 {(cov.ca*dx-cov.sa*dy)/cov.hx} else {(cov.sa*dx+cov.ca*dy)/cov.hy};
+                            if slope<0.0 {-v} else {v}
+                        };
+                        lo=lo.max(lower(&|x|value(x)>= -1.0-1e-6));
+                        end=end.min(lower(&|x|value(x)>1.0+1e-6));
+                    }
+                    table.push(words([lo as u32,end as u32,0,0]));
+                }
+            }
+            for y in t/16..=b/16 {for x in l/16..=r/16 {bins[y*tx+x].push(offset); references+=1;}}
+            if table.len()+references>4_000_000 {return Err("tile table budget".into());}
+            Ok(())
+        };
+        if let Some((r,t))=ctx.roi {
+            let (rw,rh)=(r[1]-r[0],r[3]-r[2]);
+            let (tw,th)=(t[1]-t[0],t[3]-t[2]);
+            let copies=|cc:f32,lo:f32,period:f32,wrap:bool| -> Result<(i64,i64,f32),String> {
+                if !wrap || period<=0.0 {return Ok((0,0,0.0));}
+                let k0=((lo-(cc+ext))/period).floor() as i64;
+                let k1=((lo+period-(cc-ext))/period).ceil() as i64;
+                if k1.saturating_sub(k0)>4096 {return Err("ROI copy budget".into());}
+                Ok((k0,k1,period))
+            };
+            let xs=copies(c[0],t[0],tw,ctx.wrap.0)?;
+            let ys=copies(c[1],t[2],th,ctx.wrap.1)?;
+            if (xs.1-xs.0+1)*(ys.1-ys.0+1)>4096 {return Err("ROI copy budget".into());}
+            // Keep draw_inner's f64 early rejection, before rounded f32 copy centres.
+            let early=|cc:f32,r0:f32,span:f32,n:usize,copies:(i64,i64,f32)| {
+                let ext=sz[0].abs().max(sz[1].abs()) as f64*0.7072;
+                (copies.0..=copies.1).any(|k| {
+                    let cc=cc as f64+k as f64*copies.2 as f64;
+                    let a=(cc-ext-r0 as f64)/span as f64*n as f64-0.5;
+                    let b=(cc+ext-r0 as f64)/span as f64*n as f64-0.5;
+                    a.min(b).ceil().max(0.0)<=a.max(b).floor().min(n as f64-1.0)
+                })
+            };
+            if !(src==2 && ((image_flags>>2)&3)!=1)
+                && (!early(c[0],r[0],rw,w,xs) || !early(c[1],r[2],rh,h,ys)) {continue;}
+            let axis=|cc:f32,r0:f32,span:f32,t0:f32,t1:f32,n:usize,half:f64,wrap:bool| -> Option<(usize,usize)> {
+                // Positive spans make coverage and tiling predicates monotonic. Binary searches
+                // evaluate exactly the original f64 coverage / f32 tiling expressions.
+                let lower=|pred:&dyn Fn(usize)->bool| {
+                    let (mut lo,mut hi)=(0,n);
+                    while lo<hi {let m=(lo+hi)/2;if pred(m) {hi=m;} else {lo=m+1;}}
+                    lo
+                };
+                let coverage=|p:usize| (r0 as f64+(p as f64+0.5)/n as f64*span as f64-cc as f64)/half;
+                let mut lo=lower(&|p|coverage(p)> -1.0+1e-6);
+                let mut end=lower(&|p|coverage(p)>1.0+1e-6);
+                let px0=((((cc-ext)-r0)/span*n as f32).floor() as i64-1).max(0);
+                let px1=((((cc+ext)-r0)/span*n as f32).ceil() as i64+1).min(n as i64-1);
+                lo=lo.max(px0 as usize); end=end.min((px1+1).max(0) as usize);
+                if wrap {
+                    let point=|p:usize|r0+(p as f32+0.5)/n as f32*span;
+                    lo=lo.max(lower(&|p|point(p)>=t0)); end=end.min(lower(&|p|point(p)>=t1));
+                }
+                (lo<end).then(||(lo,end-1))
+            };
+            for y in ys.0..=ys.1 {for x in xs.0..=xs.1 {
+                let center=[c[0]+x as f32*xs.2,c[1]+y as f32*ys.2];
+                let Some((l,rr))=axis(center[0],r[0],rw,t[0],t[1],w,cov.ex,ctx.wrap.0) else {continue};
+                let Some((top,b))=axis(center[1],r[2],rh,t[2],t[3],h,cov.ey,ctx.wrap.1) else {continue};
+                append([l,rr,top,b],center,0,0)?;
+            }}
+        } else {
+            let axis=|cc:f32, size:usize, half:f64, wrap:bool| -> Option<(i64,i64)> {
+                // Match draw_inner's conservative f32 bounding box before applying coverage.
+                let mut lo=(((cc-ext)*size as f32-1.0).floor() as i64).max(((cc as f64-half)*size as f64-0.5).floor() as i64-2);
+                let mut hi=(((cc+ext)*size as f32+1.0).ceil() as i64).min(((cc as f64+half)*size as f64-0.5).ceil() as i64+2);
+                let inside=|p:i64| {let b=((p as f64+0.5)/size as f64-cc as f64)/half;b> -1.0+1e-6 && b<=1.0+1e-6};
+                while lo<=hi && !inside(lo) {lo+=1;}
+                while hi>=lo && !inside(hi) {hi-=1;}
+                if !wrap {lo=lo.max(0);hi=hi.min(size as i64-1);}
+                (lo<=hi).then_some((lo,hi))
+            };
+            let Some((x0,x1))=axis(c[0],w,cov.ex,ctx.wrap.0) else {continue};
+            let Some((y0,y1))=axis(c[1],h,cov.ey,ctx.wrap.1) else {continue};
+            for cy in y0.div_euclid(h as i64)..=y1.div_euclid(h as i64) {
+                for cx in x0.div_euclid(w as i64)..=x1.div_euclid(w as i64) {
+                    let (ox,oy)=(cx*w as i64,cy*h as i64);
+                    append([(x0-ox).max(0) as usize,(x1-ox).min(w as i64-1) as usize,
+                        (y0-oy).max(0) as usize,(y1-oy).min(h as i64-1) as usize],c,ox,oy)?;
+                }
+            }
+        }
+    }
+    for (k,bin) in bins.into_iter().enumerate() {
+        table[k]=words([table.len() as u32,bin.len() as u32,0,0]);
+        table.extend(bin.into_iter().map(|i|words([i,0,0,0])));
+    }
+    Ok(Image {w:table.len(),h:1,color:true,px:table})
 }
