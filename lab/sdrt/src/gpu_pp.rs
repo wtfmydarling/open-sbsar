@@ -1215,7 +1215,7 @@ pub struct Shader {
 }
 
 pub fn compile(f: &Func, input: &dyn Fn(u32) -> Value, vp: &dyn Fn(usize) -> Value, vars: &[(u16, Value)]) -> Result<Shader, String> {
-    if f.ins.is_empty() || f.ins.len() > 4096 {
+    if f.ins.is_empty() || f.ins.len() > 65536 {
         return Err("PP shader size limit".into());
     }
     let dynamic=f.ins.iter().any(|i|i.op==11 && i.ty!=0) || (f.ins.iter().any(|i|i.op==9) && f.ins.iter().any(|i|matches!(i.op,7|50))) || crate::envc::var("SDRT_GPU_DYNAMIC").is_ok();

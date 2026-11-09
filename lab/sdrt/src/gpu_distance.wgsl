@@ -139,7 +139,9 @@ fn shade_pixel(k: u32) -> vec4<f32> {
             if ((config.header.w >> 4u) & 3u) == 0u { d = exact_sqrt(d); }
         }
         within = d < config.values.z;
-        v = max(fma(-d, config.values.w, 1.0), 0.0);
+        if config.values.z != 0.0 {
+            v = max(fma(-d, config.values.w, 1.0), 0.0);
+        }
     }
     if (config.header.w & 64u) == 0u { return vec4<f32>(v, v, v, 1.0); }
     let here = input_b[k];

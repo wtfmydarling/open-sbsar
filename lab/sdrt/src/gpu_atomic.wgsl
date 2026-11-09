@@ -141,6 +141,7 @@ fn sharpen_pixel(k:u32)->vec4<f32> {
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let k = id.y * config.header.z + id.x;
     if id.x >= config.header.z || k >= config.header.y { return; }
+    if config.header.x==7u {store(k,s_resize_pixel(k));return;}
     if config.header.x==5u {store(k,normal_pixel(k));return;}
     if config.header.x==6u {store(k,sharpen_pixel(k));return;}
     if config.header.x==3u {store(k,levels_pixel(k));return;}

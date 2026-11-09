@@ -892,14 +892,14 @@ impl<'p> Runtime<'p> {
         let ps = self.pixelsize(n, seed);
         let mode = self.param(n, "mode", seed).map_or((n.flags >> 4) & 3, |v| v[0] as u32);
         let dmax = self.param(n, "distance", seed).map_or(10.0, |v| v[0]) / 256.0;
-        let inv = 1.0f32 / dmax;
+        let inv = if dmax != 0.0 { 1.0f32 / dmax } else { 0.0f32 };
         let (ix, iy) = (1.0f32 / ps.0, 1.0f32 / ps.1);
         let scale_ok = |v: f32| v.is_finite() && (1e-6..=1e6).contains(&v.abs());
         if !(scale_ok(ix) && scale_ok(iy)) {
             self.node_vars = saved_vars;
             return early("pixel size outside the exact range");
         }
-        if !(dmax.is_finite() && dmax >= 1e-20 && inv.is_finite() && inv < 1e20) {
+        if !(dmax.is_finite() && (dmax == 0.0 || (inv.is_finite() && inv.abs() < 1e20))) {
             self.node_vars = saved_vars;
             return early("maximum distance outside the exact range");
         }
@@ -1700,16 +1700,33 @@ impl<'p> Runtime<'p> {
             _ => "atomic",
         };
         let (w, h) = n.size();
+        let g = self.gpu.as_ref().unwrap();
+        if !g.fits(w, h) {
+            return false;
+        }
         let mut image_inputs=n.inputs.clone();
         if n.op==0x02 {if let Slot::Input(k)=n.param("opacity") {image_inputs.push(*k);}}
         for &k in &image_inputs {
             let size = self.gpu.as_ref().unwrap().size(k).or_else(|| self.images.get(k).and_then(|i| i.as_ref()).map(|im| (im.w, im.h)));
-            if size != Some((w, h)) {
-                if crate::envc::var("SDRT_GPU_LOG").is_ok() {
-                    eprintln!("GPU {kern} node {}: CPU fallback (input size mismatch)", n.index);
-                }
+            let Some((iw, ih)) = size else { return false; };
+            if !self.gpu.as_ref().unwrap().fits(iw, ih) {
                 return false;
-            } // Atomic-node resize retains the CPU resampling path.
+            }
+            if (iw, ih) != (w, h) {
+                if !matches!(n.op, 0x02 | 0x1e) {
+                    if crate::envc::var("SDRT_GPU_LOG").is_ok() {
+                        eprintln!("GPU {kern} node {}: CPU fallback (input size mismatch)", n.index);
+                    }
+                    return false;
+                }
+                const RESIZE_SWITCHES: [&str; 3] = ["SDRT_RESIZE", "SDRT_RESIZEMIP", "SDRT_BIL256"];
+                if RESIZE_SWITCHES.iter().any(|s| crate::envc::var(s).is_ok()) {
+                    if crate::envc::var("SDRT_GPU_LOG").is_ok() {
+                        eprintln!("GPU {kern} node {}: CPU fallback (switch disabled)", n.index);
+                    }
+                    return false;
+                }
+            }
         }
         if image_inputs.len() > 2 {
             let g = self.gpu.as_ref().unwrap();
@@ -1720,6 +1737,39 @@ impl<'p> Runtime<'p> {
         }
         self.cur_size = [w as f32, h as f32];
         let seed = self.seed(n);
+        let gpu = self.gpu.as_mut().unwrap();
+        for &k in &image_inputs {
+            if gpu.size(k).is_none() {
+                gpu.upload(k, self.images[k].as_ref().expect("CPU input computed")).expect("GPU upload failed");
+            }
+        }
+        const GPU_RESIZE_BASE: usize = usize::MAX - 64;
+        let mut resized_inputs: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut tmp_counter = 0;
+        for &k in &image_inputs {
+            let (iw, ih, icolor) = self.gpu_image_info(k).expect("input info");
+            if (iw, ih) != (w, h) && !resized_inputs.contains_key(&k) {
+                let tmp_id = GPU_RESIZE_BASE + tmp_counter;
+                tmp_counter += 1;
+                let fmt = self.tex_format(k);
+                let mut rconfig = [0u32; 40];
+                rconfig[0] = 7;
+                rconfig[12..16].copy_from_slice(&[iw as u32, ih as u32, fmt, u32::from(icolor)]);
+                let pass = crate::gpu::Pass {
+                    config: rconfig,
+                    w,
+                    h,
+                    color: icolor,
+                    format: 3,
+                    a: crate::gpu::Src::Node(k),
+                    b: crate::gpu::Src::None,
+                };
+                self.gpu.as_mut().unwrap().dispatch_passes(tmp_id, crate::gpu::ATOMIC, &[pass]).expect("resize pass failed");
+                resized_inputs.insert(k, tmp_id);
+            }
+        }
+        let mapped_k = |k: usize| *resized_inputs.get(&k).unwrap_or(&k);
+        let effective_inputs: Vec<usize> = image_inputs.iter().map(|&k| mapped_k(k)).collect();
         let mut config = [0u32; 40];
         let (mut a, mut b) = (None, None);
         let mut sources=Vec::new();
@@ -1741,13 +1791,13 @@ impl<'p> Runtime<'p> {
                 let ps=self.pixelsize(n,seed);
                 config[4]=(intensity*w as f32/256.0*ps.0).to_bits();
                 config[5]=(intensity*h as f32/256.0*ps.1*if inv {-1.0} else {1.0}).to_bits();
-                a=Some(n.inputs[0]);
+                a=Some(mapped_k(n.inputs[0]));
             }
             0x1a=>{
                 config[0]=6; config[3]=n.b3&3;
                 config[4]=self.param(n,"intensity",seed).map_or(1.0,|v|v[0]).to_bits();
                 let ps=self.pixelsize(n,seed);config[5]=ps.0.to_bits();config[6]=ps.1.to_bits();
-                a=Some(n.inputs[0]);
+                a=Some(mapped_k(n.inputs[0]));
             }
             0x1e=>{
                 config[0]=3;config[3]=n.flags&0x400;
@@ -1760,7 +1810,7 @@ impl<'p> Runtime<'p> {
                         config[20+j*4+c]=x.to_bits();
                     }
                 }
-                a=Some(n.inputs[0]);
+                a=Some(mapped_k(n.inputs[0]));
             }
             0x02=>{
                 config[0]=4;config[3]=n.flags;
@@ -1776,8 +1826,8 @@ impl<'p> Runtime<'p> {
                         config[12..16].copy_from_slice(&[q(v[0],w),q(v[0]>>16,h),q(v[1],w),q(v[1]>>16,h)]);
                     }
                 }
-                a=Some(n.inputs[0]);b=Some(n.inputs[1]);
-                sources=image_inputs.iter().map(|&k|(Some(k),self.tex_format(k))).collect();
+                a=Some(mapped_k(n.inputs[0]));b=Some(mapped_k(n.inputs[1]));
+                sources=effective_inputs.iter().map(|&k|(Some(k), if resized_inputs.values().any(|&v| v == k) { 3 } else { self.tex_format(k) })).collect();
             }
             0x0c => {
                 let v = self.param(n, "color", seed);
@@ -1787,8 +1837,8 @@ impl<'p> Runtime<'p> {
             0x06 if n.color => {
                 config[0] = 1;
                 config[12..16].copy_from_slice(&n.flags.to_le_bytes().map(u32::from));
-                a = Some(n.inputs[0]);
-                b = Some(n.inputs[1]);
+                a = Some(mapped_k(n.inputs[0]));
+                b = Some(mapped_k(n.inputs[1]));
             }
             _ => {
                 config[0] = 2;
@@ -1798,16 +1848,14 @@ impl<'p> Runtime<'p> {
                     config[4 + c] = v[c].to_bits();
                 }
                 config[8] = self.param(n, "mattelevel", seed).map_or(1., |v| v[0]).to_bits();
-                a = Some(n.inputs[0]);
+                a = Some(mapped_k(n.inputs[0]));
             }
         }
         let gpu = self.gpu.as_mut().unwrap();
-        for k in image_inputs {
-            if gpu.size(k).is_none() {
-                gpu.upload(k, self.images[k].as_ref().expect("CPU input computed")).expect("GPU upload failed");
-            }
-        }
         gpu.dispatch(n.index, w, h, n.color, n.format(), &config, a, b, None, &sources).expect("Vulkan dispatch failed");
+        for &tmp_id in resized_inputs.values() {
+            self.gpu.as_mut().unwrap().release(tmp_id);
+        }
         if crate::envc::var("SDRT_GPU_LOG").is_ok() {
             eprintln!("GPU {kern} node {}: shader {w}x{h}", n.index);
         }

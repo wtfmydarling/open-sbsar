@@ -35,6 +35,7 @@ pub struct Pass {
 /// The transformation kernel (gpu_xf.wgsl): `header.x` selects sample / permute / halve /
 /// upsample.
 pub const XF: (&str, &str) = ("transformation", include_str!("gpu_xf.wgsl"));
+pub const ATOMIC: (&str, &str) = ("atomic", concat!(include_str!("gpu_sample.wgsl"), include_str!("gpu_atomic.wgsl")));
 
 pub struct Gpu {
     device: wgpu::Device,
@@ -84,7 +85,7 @@ impl Gpu {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sdrt basic atomic nodes"),
             source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", include_str!("gpu_prelude.wgsl"), include_str!("gpu_atomic.wgsl")).into(),
+                format!("{}\n{}\n{}", include_str!("gpu_prelude.wgsl"), include_str!("gpu_sample.wgsl"), include_str!("gpu_atomic.wgsl")).into(),
             ),
         });
         let entries: Vec<_> = (0..4)
