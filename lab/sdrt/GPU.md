@@ -1,10 +1,41 @@
-# Vulkan backend — checkpoint 2026-11-08 (transformation port)
+# Vulkan backend — checkpoint 2026-11-09
 
-This is a working **hybrid** backend, not a completed GPU runtime or a full-compatibility claim.
-CPU v28 remains frozen at `scratch/vers/sdrt_v28` and is the specification: GPU kernels must
-reproduce it bit for bit. Work and validation stay in research/sbsar.
-Previous checkpoint: `scratch/vers/sdrt_gpu_2026-11-07_pp1` (resident buffers + PP shaders).
-This checkpoint: `scratch/vers/sdrt_gpu_2026-11-08_xf1` (+ `_src.tar.gz`, `.json`).
+A **hybrid** backend that now runs ~95% of real nodes on the GPU. CPU v28 (frozen at
+`scratch/vers/sdrt_v28`) is the specification: every GPU kernel reproduces it bit for bit, except
+the documented cases (PP transcendentals and levels' `pow` use the GPU's own functions; NVIDIA
+flushes subnormal results; NaN payloads differ). Work and validation stay in research/sbsar; the
+engine is tracked in git (`research/sbsar`, remote open-sbsar). History: `sdrt_gpu_2026-11-07_pp1`,
+`sdrt_gpu_2026-11-08_xf1` in `scratch/vers`; reports of each port in `cx/gpu_*/REPORT.md`.
+
+## Status 2026-11-09
+
+| Opcode | Node | GPU kernel | Synthetic (bit-exact / cases) | Real isolated (exact / nodes) |
+| --- | --- | --- | --- | --- |
+| 0x02 | blend | gpu_atomic.wgsl | all exact (incl. resized inputs) | 279 / 279 |
+| 0x04 | transformation | gpu_xf.wgsl | 1,065 / 1,066 (+1 FTZ) | 4,746 / 4,746 |
+| 0x06 / 0x0c | gray, shuffle, uniform | gpu_atomic.wgsl | 20 / 20 | — |
+| 0x00 | gradient map | gpu_gradient.wgsl | 477 / 477 | 1,812 / 1,812 |
+| 0x0e / 0x18 | warp, directional warp | gpu_warp.wgsl | 884 / 892 (+6 NaN payload, 2 FTZ) | } 3,428 / 3,429 (1 FTZ) |
+| 0x14 / 0x16 | blur, directional motion blur | gpu_blur.wgsl, gpu_mblur.wgsl | 911 / 917 (+4 NaN, 2 FTZ) | } |
+| 0x10, 0x1c, 0x26, 0x2c | emboss, HSL, dynamic gradient, curve | gpu_color_*.wgsl | 577 / 577 | 788 / 788 |
+| 0x1a / 0x24 | sharpen, normal | gpu_atomic.wgsl | 96 / 96 | 66 / 66 |
+| 0x1e | levels | gpu_atomic.wgsl | exact except `pow` (mid ≠ 0.5): 20 / 28 | 276 / 283 |
+| 0x28 | pixel processor | generated (gpu_pp.rs) | suites pass; transcendentals native | control flow 229 / 234 |
+| 0x2a | distance | gpu_distance.wgsl | 1,614 / 1,614 | 330 / 330 |
+| 0x08 | FX-Map | in progress (`cx/gpu_fxmap`) | 741 / 742 (+1 FTZ), subset | 45 / 456 run on GPU |
+
+CPU by design: bitmaps (0x20), text (0x22), SVG (0x0a), value processors, legacy motion blur
+(0x12). GPU coverage of whole-graph renders, 45 files at 128²: 36,442 / 38,271 nodes (95.2%);
+the rest is mostly FX-Maps and value processors. Speed (`cx/gpu_perf/REPORT.md`, whole files):
+1024² 2.2–13.4× faster than the CPU path, 2048² 1.4–14.8×; FX-Maps (CPU) dominate what remains.
+Whole-graph GPU renders equal the CPU's byte for byte on most outputs (green-mosaic at 512²:
+17 of 22 outputs; the others differ by ≤ 9/65535 on < 0.1% of pixels, from PP transcendentals).
+
+Infrastructure: `Gpu::dispatch_passes` (kernel chains, one submission), batched command
+encoders and buffer pools, `GPU_TABLE` uploads of per-node tables, `gpu_sample.wgsl` (exact
+samplers, safe integer wrap, the `resized` pass), prelude `barrier()`, `unorm_float`, correctly
+rounded `div_rn` / `sqrt_rn`. `SDRT_GPU_OPS=02,1e,...` restricts the GPU to the listed opcodes
+(isolated real-file checks). All suites: `python3 lab/py/gpu_regression.py` (20 suites).
 
 ## Run
 
@@ -44,7 +75,10 @@ Diagnostics:
   (two-slot or packed inputs) and `barrier()` (below).
 - Atomic kernels (`gpu_atomic.wgsl`): uniform colour (`0x0c`), grayscale / alpha matte and
   channel shuffle (`0x06`), blend (`0x02`, incl. opacity input and crop mask), levels (`0x1e`),
-  normal (`0x24`), sharpen (`0x1a`). Same-size inputs only (resizing stays on the CPU).
+  normal (`0x24`), sharpen (`0x1a`); inputs of another size go through the exact `resized` pass.
+- Filter and colour kernels, distance and the FX-Map subset: see the status table above and the
+  helpers' reports (`cx/gpu_filters`, `cx/gpu_color`, `cx/gpu_distance`, `cx/gpu_exact`,
+  `cx/gpu_gaps`, `cx/gpu_perf`, `cx/gpu_fxmap`).
 - Pixel Processor (`0x28`) shader generation (`gpu_pp.rs`, `gpu_pp.wgsl`, `gpu_control.wgsl`):
   see the 2026-11-07 notes below; since then also conditional rand / variable mutation / loops
   through a "control-flow" form, and more than two inputs (packed by GPU-to-GPU copies).
@@ -147,19 +181,11 @@ creation time is large static shaders whose ~100 `sample_image` calls are each i
 
 ## Next work
 
-1. PP compile cost: done for the control-flow form (`cx/gpu_ppfast/REPORT.md`). Left: smaller
-   sampler code for big static shaders, and a dispatcher or implied-flag tracking for chains of
-   whole values under runtime checks (the 20,000-line limit).
-2. Apply `barrier()` to the atomic blend/levels/normal/sharpen kernels and PP sampling; residual
-   divisions/sqrt/pow need correctly rounded implementations to become exact.
-3. Port the next frequent kernels (blur, warp, gradient map, FX-Map, distance...), then command
-   batching, buffer reuse and representative timings; optionally `DenormPreserve` via SPIR-V
-   passthrough if subnormal parity matters.
-4. Then the broad writer/readback round-trip campaign and the full cached survey on the GPU.
-
-No Adobe implementation, shader extraction, decompilation or API capture was used.
-
----
+1. FX-Maps on the GPU beyond the current subset (rotation, every pattern kind, image patterns,
+   arbitrary sizes, streamed draw lists): `cx/gpu_fxmap/TASK2.md`, in progress.
+2. Exact `pow` and the PP transcendentals, or a measured decision to keep the GPU's own
+   functions where they match Substance's GPU engine better (compare against the 14.1 vk cache).
+3. Large verification campaigns on the GPU (full cached survey, writer round trips).
 
 ## 2026-11-07 notes (still valid)
 
