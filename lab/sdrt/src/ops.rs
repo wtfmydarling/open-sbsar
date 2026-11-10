@@ -819,23 +819,17 @@ impl<'p> Runtime<'p> {
             return early("non-finite intensity, angle, pixelsize or offset");
         }
         let wrap = n.b3 & 3;
-        let fmt = self.tex_format(ks);
-        let mut passes = Vec::new();
-        let amount = if (ai.0, ai.1) == (w, h) {
-            Src::Node(ka)
-        } else {
-            // input_at: the intensity input resized to the node (unquantized, its colour flag)
-            passes.push(Self::filter_pass(2, 0, [ai.0 as u32, ai.1 as u32, 3, u32::from(ai.2)], (w, h), ai.2, 3, Src::Node(ka), Src::None));
-            Src::Pass(0)
-        };
-        let mut pass = Self::filter_pass(1, wrap | u32::from(ai.2) << 3, [si.0 as u32, si.1 as u32, fmt, u32::from(si.2)], (w, h), n.color, n.format(), Src::Node(ks), amount);
+        let same = (ai.0, ai.1) == (w, h);
+        let (fmt, afmt) = (self.tex_format(ks), self.tex_format(ka));
+        let flags = wrap | u32::from(same) << 2 | u32::from(ai.2) << 3;
+        let mut pass = Self::filter_pass(1, flags, [si.0 as u32, si.1 as u32, fmt, u32::from(si.2)], (w, h), n.color, n.format(), Src::Node(ks), Src::Node(ka));
+        pass.config[4..8].copy_from_slice(&[ai.0 as u32, ai.1 as u32, afmt, u32::from(ai.2)]);
         pass.config[20..24].copy_from_slice(&[dx, dy, sub, 0.0].map(f32::to_bits));
-        passes.push(pass);
-        self.gpu_filter_dispatch(n, GPU_WARP, &[ks, ka], None, &passes);
+        self.gpu_filter_dispatch(n, GPU_WARP, &[ks, ka], None, &[pass]);
         if log {
             eprintln!(
-                "GPU dirwarp node {}: shader {} {} passes, {w}x{h} from {}x{} intensity {}x{}, d ({dx}, {dy}) offset {sub} tiling {wrap}",
-                n.index, if passes.len() > 1 { "resized-intensity" } else { "direct" }, passes.len(), si.0, si.1, ai.0, ai.1
+                "GPU dirwarp node {}: shader direct 1 passes, {w}x{h} from {}x{} intensity {}x{}, d ({dx}, {dy}) offset {sub} tiling {wrap}",
+                n.index, si.0, si.1, ai.0, ai.1
             );
         }
         true
@@ -2895,7 +2889,13 @@ impl<'p> Runtime<'p> {
         let (w, h) = n.size();
         // a larger source is sampled at its own size (as the warp's); SDRT_WARPBIG=0: resized (old)
         let src = if crate::env_once!("SDRT_WARPBIG").as_deref() != Ok("0") { self.images[n.inputs[0]].clone().expect("input computed") } else { self.input_at(n.inputs[0], w, h) };
-        let amount = self.input_at(n.inputs[1], w, h);
+        let amount = if crate::env_once!("SDRT_WARPBIG").as_deref() == Ok("0") {
+            self.input_at(n.inputs[1], w, h)
+        } else {
+            self.images[n.inputs[1]].clone().expect("input computed")
+        };
+        let afmt = self.tex_format(n.inputs[1]);
+        let same = (amount.w, amount.h) == (w, h);
         // the default intensity is 10 (raw_copper 94, no intensity word: frozen 0.50 → 0.0007)
         let dflt: f32 = crate::envc::var("SDRT_DWDEF").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0);
         let inten = self.param(n, "intensity", seed).map_or(dflt, |v| v[0]);
@@ -2920,10 +2920,16 @@ impl<'p> Runtime<'p> {
         use rayon::prelude::*;
         o.px.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for x in 0..w {
-                let a = amount.px[y * w + x];
+                let u0 = (x as f32 + 0.5) / w as f32;
+                let v0 = (y as f32 + 0.5) / h as f32;
+                let a = if same {
+                    amount.px[y * w + x]
+                } else {
+                    amount.bilinear_or(u0, v0, wrap, None, afmt)
+                };
                 let m = if amount.color { a[3] } else { a[0] } - sub;
-                let u = (x as f32 + 0.5) / w as f32 + dx * m;
-                let v = (y as f32 + 0.5) / h as f32 + dy * m;
+                let u = u0 + dx * m;
+                let v = v0 + dy * m;
                 row[x] = src.bilinear_or(u, v, wrap, None, fmt);
             }
         });

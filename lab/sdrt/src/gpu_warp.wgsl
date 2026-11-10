@@ -52,12 +52,23 @@ fn warp_pixel(k: u32) -> vec4<f32> {
 fn dirwarp_pixel(k: u32) -> vec4<f32> {
     let w = config.header.z;
     let h = config.header.y / w;
+    let x = k % w;
+    let y = k / w;
+    let wrap = wrap_bits();
+    let ad = bitcast<vec4<u32>>(config.values);
     let par = config.parameters[0];
-    let a = input_b[k];
+    let u0 = (f32(x) + 0.5) / f32(w);
+    let v0 = (f32(y) + 0.5) / f32(h);
+    var a: vec4<f32>;
+    if (config.header.w & 4u) != 0u {
+        a = s_fetch(1u, ad, i32(x), i32(y), wrap);
+    } else {
+        a = s_bilinear_or(1u, ad, u0, v0, wrap);
+    }
     let m = grad_value(a) - par.z;
-    let u = (f32(k % w) + 0.5) / f32(w) + barrier(par.x * m);
-    let v = (f32(k / w) + 0.5) / f32(h) + barrier(par.y * m);
-    return s_bilinear_or(0u, config.selectors, u, v, wrap_bits());
+    let u = u0 + barrier(par.x * m);
+    let v = v0 + barrier(par.y * m);
+    return s_bilinear_or(0u, config.selectors, u, v, wrap);
 }
 
 @compute @workgroup_size(8, 8)

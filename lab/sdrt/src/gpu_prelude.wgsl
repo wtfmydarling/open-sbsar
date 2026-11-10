@@ -297,8 +297,11 @@ fn div_rn(a: f32, b: f32) -> f32 {
     let sign=(ba^bb)&0x80000000u;
     // A non-finite operand: the driver's own division (IEEE, apart from the NaN payload).
     if ((ba&0x7f800000u)==0x7f800000u) || ((bb&0x7f800000u)==0x7f800000u) {return a/b;}
+    if (bb&0x7fffffffu)==0u {
+        if (ba&0x7fffffffu)==0u {return bitcast<f32>(sign|0x7fc00000u);}
+        return bitcast<f32>(sign|0x7f800000u);
+    }
     if (ba&0x7fffffffu)==0u {return bitcast<f32>(sign);}
-    if (bb&0x7fffffffu)==0u {return bitcast<f32>(sign|0x7f800000u);}
     // The normalised mantissas and exponents.
     var A=(ba&0x007fffffu)|0x800000u;
     var ea=i32((ba>>23u)&255u)-127;
