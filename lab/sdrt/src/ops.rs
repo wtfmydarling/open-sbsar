@@ -1504,48 +1504,13 @@ impl<'p> Runtime<'p> {
 
     #[cfg(feature = "gpu")]
     fn materialize_for_node(&mut self, node: &Node) {
-        match node.op {
-            0x0C | 0x20 | 0x0A | 0x22 => {} // no inputs read by uniform color, bitmap, svg, text
-            0x04 | 0x00 | 0x14 | 0x16 | 0x12 | 0x1A | 0x1C | 0x1E | 0x24 => {
-                if let Some(&k) = node.inputs.get(0) { self.materialize(k); }
-            }
-            0x06 => {
-                if node.color {
-                    for &k in node.inputs.iter().take(2) { self.materialize(k); }
-                } else if let Some(&k) = node.inputs.get(0) {
-                    self.materialize(k);
-                }
-            }
-            0x02 => {
-                for &k in node.inputs.iter().take(2) { self.materialize(k); }
-                if let Slot::Input(k) = node.param("opacity") { self.materialize(*k); }
-            }
-            0x0E | 0x18 | 0x26 | 0x2A | 0x10 => {
-                for &k in node.inputs.iter().take(2) { self.materialize(k); }
-            }
-            0x2C => {
-                let along_x = node.flags & 1 != 0;
-                if !along_x {
-                    if let Some(&k) = node.inputs.get(0) { self.materialize(k); }
-                }
-            }
-            0x28 => {
-                let f = self.func(node.data);
-                for i in &f.ins {
-                    if i.op == 51 || i.op == 52 {
-                        let slot = i.ops[1] as usize;
-                        if let Some(&k) = node.inputs.get(slot) {
-                            self.materialize(k);
-                        }
-                    }
-                }
-            }
-            _ => {
-                for &k in &node.inputs { self.materialize(k); }
-                for (_, slot) in &node.params {
-                    if let Slot::Input(k) = slot { self.materialize(*k); }
-                }
-            }
+        // Every image input and image parameter of a CPU node is read back. A selective version
+        // (only the inputs each op reads) missed inputs that some ops read conditionally (SVG and
+        // text backgrounds, dynamic PP sampler slots, input_at in helpers) and panicked with
+        // "input computed" on real files; readbacks are cheap next to a CPU node.
+        for &k in &node.inputs { self.materialize(k); }
+        for (_, slot) in &node.params {
+            if let Slot::Input(k) = slot { self.materialize(*k); }
         }
     }
 
