@@ -343,7 +343,9 @@ impl Gpu {
             let bb_buf = Arc::new(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("PP input descriptors"),
                 contents: bytemuck::cast_slice(&descriptors),
-                usage: wgpu::BufferUsages::STORAGE,
+                // returned to the buffer pool afterwards and reused as an image buffer: it needs
+                // the pooled buffers' usages (a STORAGE-only buffer broke a later readback copy)
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             }));
             bb = bb_buf.clone();
             packed_bb = Some(bb_buf);
