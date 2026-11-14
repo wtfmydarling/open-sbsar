@@ -7,6 +7,9 @@
 mod api;
 pub use api::{Error, Graph, InputImage, OutputImage, Package, Parameters, PixelFormat, Renderer, Result, Value};
 pub use package::{InputInfo, InputKind, OutputInfo};
+/// The wgpu version this crate uses (for [`Renderer::with_device`]).
+#[cfg(feature = "gpu")]
+pub use wgpu;
 
 // Engine internals, public for the command-line tool and research probes; not a stable API.
 #[doc(hidden)]

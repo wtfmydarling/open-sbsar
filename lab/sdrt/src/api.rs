@@ -299,6 +299,15 @@ impl Renderer {
     pub fn new_gpu() -> Result<Renderer> {
         Ok(Renderer { gpu: Some(crate::gpu::Gpu::new()?), warnings: vec![] })
     }
+    /// The GPU path on a device the host application already uses (its `wgpu::Device` and
+    /// `wgpu::Queue`, wgpu 30: see [`crate::wgpu`]). Nothing is requested from the device; an
+    /// error says which limit is too small. Results are bit-exact with the CPU path on the
+    /// hardware this was validated on (see the repository's GPU.md); other drivers may round
+    /// differently in the last bits.
+    #[cfg(feature = "gpu")]
+    pub fn with_device(device: wgpu::Device, queue: wgpu::Queue) -> Result<Renderer> {
+        Ok(Renderer { gpu: Some(crate::gpu::Gpu::from_device(device, queue)?), warnings: vec![] })
+    }
     /// Whether this renderer uses the GPU.
     pub fn is_gpu(&self) -> bool {
         #[cfg(feature = "gpu")]

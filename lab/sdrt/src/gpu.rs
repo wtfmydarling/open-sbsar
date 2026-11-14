@@ -61,15 +61,16 @@ pub struct Gpu {
 }
 impl Gpu {
     pub fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..Default::default() });
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
         let (info, device, queue) = {
             let mut last_err = String::new();
             let mut res = None;
             for _ in 0..100 {
-                let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
                     force_fallback_adapter: false,
                     compatible_surface: None,
+        apply_limit_buckets: false,
                 })) else {
                     last_err = "no Vulkan adapter".into();
                     std::thread::sleep(std::time::Duration::from_millis(250));
@@ -84,8 +85,7 @@ impl Gpu {
                 required_limits.max_storage_buffer_binding_size = ad_limits.max_storage_buffer_binding_size;
                 required_limits.max_buffer_size = ad_limits.max_buffer_size;
                 let dq = pollster::block_on(adapter.request_device(
-                    &wgpu::DeviceDescriptor { label: Some("sdrt"), required_features: wgpu::Features::empty(), required_limits },
-                    None,
+                    &wgpu::DeviceDescriptor { label: Some("sdrt"), required_features: wgpu::Features::empty(), required_limits, ..Default::default() },
                 ));
                 drop(adapter);
                 match dq {
@@ -98,7 +98,22 @@ impl Gpu {
             }
             res.ok_or(last_err)?
         };
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        if std::env::var_os("SDRT_GPU_LOG").is_some() {
+            eprintln!("GPU: {} ({:?}, {}); initial hybrid backend", info.name, info.backend, info.driver);
+        }
+        Self::from_device(device, queue)
+    }
+
+    pub fn from_device(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, String> {
+        let limits = device.limits();
+        if limits.max_storage_buffer_binding_size < 160 || limits.max_buffer_size < 160
+            || limits.max_storage_buffers_per_shader_stage < 4
+            || limits.max_bind_groups < 1 || limits.max_bindings_per_bind_group < 4
+            || limits.max_compute_workgroup_size_x < 8 || limits.max_compute_workgroup_size_y < 8
+            || limits.max_compute_invocations_per_workgroup < 64 || limits.max_compute_workgroups_per_dimension < 1 {
+            return Err("GPU device limits are too small: need four storage buffers, 160-byte bindings and 8x8 compute workgroups".into());
+        }
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sdrt basic atomic nodes"),
             source: wgpu::ShaderSource::Wgsl(
@@ -120,16 +135,18 @@ impl Gpu {
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("node buffers"), entries: &entries });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("node layout"),
-            bind_group_layouts: &[&bind_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("sdrt atomic"),
             layout: Some(&layout),
             module: &module,
-            entry_point: "main",
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
         });
-        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
             return Err(error.to_string());
         }
         let dummy = Arc::new(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -137,7 +154,6 @@ impl Gpu {
             contents: bytemuck::cast_slice(&[[0f32; 4]]),
             usage: wgpu::BufferUsages::STORAGE,
         }));
-        eprintln!("GPU: {} ({:?}, {}); initial hybrid backend", info.name, info.backend, info.driver);
         Ok(Self {
             device,
             queue,
@@ -274,16 +290,18 @@ impl Gpu {
         if let Some((source, _)) = shader {
             if !self.pp.contains_key(source) {
                 let start = std::time::Instant::now();
-                self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let module =
                     self.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("PP"), source: wgpu::ShaderSource::Wgsl(source.into()) });
                 let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("PP"),
                     layout: Some(&self.layout),
                     module: &module,
-                    entry_point: "main",
+                    entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
                 });
-                if let Some(e) = pollster::block_on(self.device.pop_error_scope()) {
+                if let Some(e) = pollster::block_on(error_scope.pop()) {
                     return Err(e.to_string());
                 }
                 if std::env::var("SDRT_GPU_LOG").is_ok() {
@@ -410,7 +428,7 @@ impl Gpu {
     pub fn dispatch_passes(&mut self, id: usize, kernel: (&'static str, &'static str), passes: &[Pass]) -> Result<(), String> {
         let last = passes.last().ok_or("kernel chain without passes")?;
         if !self.kernels.contains_key(kernel.0) {
-            self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
             let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(kernel.0),
                 source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", include_str!("gpu_prelude.wgsl"), kernel.1).into()),
@@ -419,9 +437,11 @@ impl Gpu {
                 label: Some(kernel.0),
                 layout: Some(&self.layout),
                 module: &module,
-                entry_point: "main",
+                entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
             });
-            if let Some(e) = pollster::block_on(self.device.pop_error_scope()) {
+            if let Some(e) = pollster::block_on(error_scope.pop()) {
                 return Err(format!("{} kernel: {e}", kernel.0));
             }
             self.kernels.insert(kernel.0, Arc::new(pipeline));
@@ -502,9 +522,9 @@ impl Gpu {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
-        let mapped = slice.get_mapped_range();
+        let mapped = slice.get_mapped_range().expect("mapped buffer range");
         let px = bytemuck::cast_slice::<u8, [f32; 4]>(&mapped).to_vec();
         drop(mapped);
         read.unmap();
@@ -516,8 +536,10 @@ impl Gpu {
 impl Drop for Gpu {
     fn drop(&mut self) {
         self.flush();
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        if std::env::var_os("SDRT_GPU_LOG").is_some() {
         eprintln!("GPU: {} cached PP pipelines, {} device input copies", self.pp.len(), self.input_copies);
         eprintln!("GPU: {} compute dispatches, {} uploads, {} readbacks (other nodes ran on CPU)", self.dispatched, self.uploads, self.downloads);
+        }
     }
 }

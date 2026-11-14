@@ -45,7 +45,7 @@ path = "src/bin/gpu_exact_probe.rs"
 required-features = ["gpu"]
 
 [dependencies.wgpu]
-version = "0.19.4"
+version = "30"
 optional = true
 features = ["wgsl"]
 

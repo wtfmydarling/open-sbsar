@@ -15,16 +15,16 @@ fn main() {
     let raw = std::fs::read(std::env::args().nth(2).expect("the source image")).expect("read the source");
     let (w, h) = (u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize, u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize);
     let pixels: &[f32] = bytemuck::cast_slice(&raw[8..]);
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..Default::default() });
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
+        apply_limit_buckets: false,
     }))
     .expect("no Vulkan adapter");
     let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor { label: Some("probe"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default() },
-        None,
+        &wgpu::DeviceDescriptor { label: Some("probe"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default(), ..Default::default() },
     ))
     .expect("device");
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -42,14 +42,16 @@ fn main() {
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("probe"), entries: &entries });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("probe"),
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("probe"),
         layout: Some(&pipeline_layout),
         module: &module,
-        entry_point: "main",
+        entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
     });
     let src = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("src"),
@@ -90,9 +92,9 @@ fn main() {
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped buffer range");
     let values: &[f32] = bytemuck::cast_slice(&mapped);
     for (i, v) in values.iter().take(40).enumerate() {
         println!("{i} {} {:#010x}", v, v.to_bits());

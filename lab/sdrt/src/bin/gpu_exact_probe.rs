@@ -45,16 +45,16 @@ fn main() {
         values.push(v);
     }
     let count = values.len();
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..Default::default() });
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
+        apply_limit_buckets: false,
     }))
     .expect("no Vulkan adapter");
     let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor { label: Some("probe"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default() },
-        None,
+        &wgpu::DeviceDescriptor { label: Some("probe"), required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default(), ..Default::default() },
     ))
     .expect("device");
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -72,14 +72,16 @@ fn main() {
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("probe"), entries: &entries });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("probe"),
-        bind_group_layouts: &[&layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("probe"),
         layout: Some(&pipeline_layout),
         module: &module,
-        entry_point: "main",
+        entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
     });
     // The source image: one value per pixel, in the four channels.
     let mut pixels: Vec<f32> = Vec::with_capacity(count * 4);
@@ -126,9 +128,9 @@ fn main() {
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped buffer range");
     let got: &[f32] = bytemuck::cast_slice(&mapped);
     // The comparison: the GPU's helper against the CPU's own correctly rounded operation.
     let mut sqrt_bad = 0usize;
