@@ -8,6 +8,7 @@
 !/LICENSE*
 !/NOTICE
 !/docs/
+!/.github/
 
 # the engine (Rust crate), without build output
 !/lab/

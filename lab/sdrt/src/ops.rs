@@ -252,6 +252,19 @@ impl<'p> Runtime<'p> {
         }
     }
 
+    /// Use an existing GPU context (its pipelines stay cached across runtimes).
+    #[cfg(feature = "gpu")]
+    pub fn attach_gpu(&mut self, gpu: crate::gpu::Gpu) {
+        self.gpu = Some(gpu);
+    }
+    /// Take the GPU context back, its graph images released.
+    #[cfg(feature = "gpu")]
+    pub fn detach_gpu(&mut self) -> Option<crate::gpu::Gpu> {
+        if let Some(g) = &mut self.gpu {
+            g.reset();
+        }
+        self.gpu.take()
+    }
     pub fn enable_gpu(&mut self) -> Result<(), String> {
         #[cfg(feature = "gpu")]
         { self.gpu = Some(crate::gpu::Gpu::new()?); Ok(()) }

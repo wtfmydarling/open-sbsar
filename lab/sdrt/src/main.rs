@@ -1,74 +1,28 @@
-//! sdrt: run a compiled Substance program on the CPU, from what research/sbsar/NOTES.md says.
+//! sdrt: the command-line tool of open-sbsar (research and batch rendering).
 //!
-//! Add `--backend vulkan` (build with `--features gpu`) for the initial hybrid compute path.
+//! Add `--backend vulkan` for the GPU path.
 //! `sdrt render FILE OUTDIR` writes every output as a 16-bit PNG named after its identifier;
 //! `sdrt node FILE INDEX OUT.png` writes one node's image. FILE is a .sbsar or an .sbsasm.
 
-#[cfg(feature = "gpu")]
-mod gpu;
-#[cfg(feature = "gpu")]
-mod gpu_pp;
-mod envc;
-mod fxmap;
-mod image;
-mod jpeg;
-mod ops;
-mod program;
-mod text;
-mod vm;
+use open_sbsar::{envc, fxmap, image, ops, package, program, vm};
 
 use std::path::Path;
 
 use program::Program;
 
-fn member(path: &Path, pattern: &str) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new("7z")
-        .args(["e", "-so", "-r"])
-        .arg(path)
-        .arg(pattern)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return Err(format!("7z could not read {pattern} from {}", path.display()));
-    }
-    Ok(out.stdout)
-}
-
-/// The program and its description (XML), from a .sbsar or a directory's program.sbsasm.
 fn load(path: &Path) -> Result<(Vec<u8>, String), String> {
-    if path.extension().is_some_and(|e| e == "sbsasm") {
-        let b = std::fs::read(path).map_err(|e| e.to_string())?;
-        let xml = std::fs::read_to_string(path.with_extension("xml")).unwrap_or_default();
-        return Ok((b, xml));
-    }
-    Ok((member(path, "*.sbsasm")?, String::from_utf8_lossy(&member(path, "*.xml")?).into_owned()))
+    package::load_path(path)
 }
 
-/// uid of each input by identifier in the XML.
-fn input_uids(xml: &str) -> Vec<(String, u32)> {
-    let mut v = vec![];
-    for part in xml.split("<input ").skip(1) {
-        let attr = |name: &str| part.split(&format!("{name}=\"")).nth(1).and_then(|s| s.split('"').next()).map(str::to_string);
-        if let (Some(uid), Some(id)) = (attr("uid"), attr("identifier")) {
-            if let Ok(u) = uid.parse() {
-                v.push((id, u));
-            }
-        }
-    }
-    v
+fn output_names(xml: &str) -> Vec<(u32, String)> {
+    package::output_names(xml)
 }
 
 /// Apply `--set ID=v[,v…]` options to the runtime's inputs (ints for int inputs, floats else).
 fn apply_sets(rt: &mut ops::Runtime, xml: &str, sets: &[String]) -> Result<(), String> {
-    let uids = input_uids(xml);
-    // string inputs (type 6): their XML defaults, XML entities decoded
-    for part in xml.split("<input ").skip(1) {
-        let head = format!(" {}", part.split('>').next().unwrap_or("")).replace(['\n', '\t', '\r'], " ");
-        let attr = |name: &str| head.split(&format!(" {name}=\"")).nth(1).and_then(|s| s.split('"').next()).map(str::to_string);
-        if attr("type").as_deref() != Some("6") { continue; }
-        if let (Some(uid), Some(d)) = (attr("uid").and_then(|u| u.parse::<u32>().ok()), attr("default")) {
-            rt.strings.insert(uid, xml_unescape(&d));
-        }
+    let uids = package::input_uids(xml);
+    for (uid, d) in package::string_defaults(xml) {
+        rt.strings.insert(uid, d);
     }
     for s in sets {
         let (id, val) = s.split_once('=').ok_or("--set ID=value")?;
@@ -89,42 +43,6 @@ fn apply_sets(rt: &mut ops::Runtime, xml: &str, sets: &[String]) -> Result<(), S
         rt.inputs.insert(uid, v);
     }
     Ok(())
-}
-
-/// XML attribute text: the five named entities and numeric character references.
-fn xml_unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        let Some(j) = tail.find(';') else { out.push_str(tail); return out };
-        let ent = &tail[1..j];
-        let c = match ent {
-            "amp" => Some('&'), "lt" => Some('<'), "gt" => Some('>'), "quot" => Some('"'), "apos" => Some('\''),
-            _ if ent.starts_with("#x") || ent.starts_with("#X") => u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32),
-            _ if ent.starts_with('#') => ent[1..].parse().ok().and_then(char::from_u32),
-            _ => None,
-        };
-        match c { Some(c) => out.push(c), None => out.push_str(&tail[..=j]) }
-        rest = &tail[j + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// uid → identifier of each output in the XML.
-fn output_names(xml: &str) -> Vec<(u32, String)> {
-    let mut v = vec![];
-    for part in xml.split("<output ").skip(1) {
-        let attr = |name: &str| part.split(&format!("{name}=\"")).nth(1).and_then(|s| s.split('"').next()).map(str::to_string);
-        if let (Some(uid), Some(id)) = (attr("uid"), attr("identifier")) {
-            if let Ok(u) = uid.parse() {
-                v.push((u, id));
-            }
-        }
-    }
-    v
 }
 
 fn save(img: &image::Image, path: &Path) -> Result<(), String> {

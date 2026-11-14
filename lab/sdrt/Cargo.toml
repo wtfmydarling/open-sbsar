@@ -1,25 +1,35 @@
 # sdrt: the open-sbsar engine for compiled Substance programs (.sbsasm): a CPU reference path
 # and an optional Vulkan backend (--features gpu).
 [package]
-name = "sdrt"
-version = "0.0.0"
+name = "open-sbsar"
+version = "0.1.0"
 edition = "2024"
 description = "A clean-room engine for compiled Substance archives (.sbsar)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wtfmydarling/open-sbsar"
 publish = false
 
+[lib]
+name = "open_sbsar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sdrt"
+path = "src/main.rs"
+
 [workspace]
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 rayon = "1.12"
+roxmltree = "0.21.2"
+sevenz-rust2 = { version = "0.25", default-features = false }
 
 [profile.release]
 debug = 1
 
 [features]
-default = []
+default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 # research probe (lab/sdrt/src/bin/gpu_fma.rs): only with the Vulkan backend
