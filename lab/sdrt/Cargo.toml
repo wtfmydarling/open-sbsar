@@ -1,5 +1,4 @@
-# sdrt: the open-sbsar engine for compiled Substance programs (.sbsasm): a CPU reference path
-# and an optional Vulkan backend (--features gpu).
+# open-sbsar: the library (src/lib.rs) and the sdrt command-line tool (src/main.rs).
 [package]
 name = "open-sbsar"
 version = "0.1.0"
@@ -7,7 +6,10 @@ edition = "2024"
 description = "A clean-room engine for compiled Substance archives (.sbsar)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wtfmydarling/open-sbsar"
-publish = false
+readme = "../../README.md"
+keywords = ["substance", "sbsar", "procedural", "texture", "material"]
+categories = ["graphics", "rendering", "multimedia::images"]
+exclude = ["GPU.md"]
 
 [lib]
 name = "open_sbsar"
@@ -31,18 +33,20 @@ debug = 1
 [features]
 default = ["gpu"]
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+# research probes (src/bin): not built for users
+research = ["gpu"]
 
 # research probe (lab/sdrt/src/bin/gpu_fma.rs): only with the Vulkan backend
 [[bin]]
 name = "gpu_fma"
 path = "src/bin/gpu_fma.rs"
-required-features = ["gpu"]
+required-features = ["research"]
 
 # research probe: the prelude's correctly rounded helpers against the CPU's
 [[bin]]
 name = "gpu_exact_probe"
 path = "src/bin/gpu_exact_probe.rs"
-required-features = ["gpu"]
+required-features = ["research"]
 
 [dependencies.wgpu]
 version = "30"

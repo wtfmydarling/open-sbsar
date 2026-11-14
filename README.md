@@ -1,12 +1,90 @@
 # open-sbsar
 
-An open, clean-room implementation of the runtime behind compiled Substance archives
-(`.sbsar`): a reader and renderer for the compiled programs inside them (`.sbsasm`), a
-bit-level specification of the format, and a writer that produces `.sbsar` files.
+An open, clean-room engine for compiled Substance archives (`.sbsar`): a Rust library that opens
+`.sbsar` files, exposes their parameters and renders their outputs on the GPU (wgpu/Vulkan) or on
+the CPU; a command-line tool; a writer that produces `.sbsar` files; and a bit-level
+specification of the format.
 
-Status: research software, under active development. Not affiliated with, endorsed by or
-derived from code of Adobe. "Substance" is a trademark of its owner; it is used here only to
-name the file format this project interoperates with.
+Not affiliated with, endorsed by or derived from code of Adobe. "Substance" is a trademark of its
+owner; it is used here only to name the file format this project interoperates with.
+
+## Status
+
+Version 0.1: usable, under active development.
+
+- **Accuracy**, measured against Substance 3D Designer 14.1's own renderer (its Vulkan engine) on
+  227 real materials at 128², every internal node compared: 88.6% of the nodes are identical
+  within one 8-bit code; of 1,571 outputs, 71.2% are identical within 1/255, 14.3% differ by
+  less than 0.02 and 14.4% by more (usually a few pixels: by eye, most of them cannot be told
+  apart from Substance's output). Most remaining differences are floating-point noise that
+  Substance's own CPU and GPU engines also disagree on, amplified by threshold chains.
+- **Every node type** of the format is implemented: the library renders all 1,388 files of the
+  Substance community library.
+- **GPU**: about 95% of the nodes of real graphs run on the GPU, bit-exact with the CPU path
+  (except pixel-processor transcendentals and levels' gamma, which use the GPU's own functions,
+  as Substance's GPU engine does). Validated on an NVIDIA RTX 4070 SUPER (Vulkan). A material at
+  512² re-renders with new parameters in about 0.5 s once its shaders are compiled.
+- **Not yet**: graph image inputs (the API is in place; images are not evaluated yet), incremental
+  re-rendering of only the nodes a parameter change affects, WebAssembly/WebGPU.
+
+## Library
+
+```toml
+[dependencies]
+open-sbsar = "0.1"            # default feature "gpu" (wgpu 30); default-features = false: CPU only
+```
+
+```rust
+use open_sbsar::{Package, Parameters, Renderer, Value};
+
+let package = Package::open("material.sbsar")?;            // or Package::from_bytes(&bytes)
+let graph = &package.graphs()[0];
+for input in graph.inputs() {                               // identifier, kind, default, range, label…
+    println!("{} {:?} {:?}", input.identifier, input.kind, input.default);
+}
+let mut params = Parameters::new();
+params.set("$outputsize", Value::Int(vec![10, 10]));        // log2 sizes: 1024 x 1024
+params.set("$randomseed", Value::Int(vec![42]));
+
+let mut renderer = Renderer::new_gpu()?;                    // or Renderer::new_cpu()
+for out in renderer.render(graph, &params, None)? {         // None: every image output
+    // out.format: U8 / U16 / F16 / F32, the format the graph computes the output in;
+    // out.data holds those bytes; out.as_f32(), to_rgba_f32(), to_rgba16(), to_rgba8() convert
+    println!("{} {}x{} {} channel(s) {:?}", out.identifier, out.width, out.height, out.channels, out.format);
+}
+```
+
+- **Your own GPU device**: `Renderer::with_device(device, queue)` renders on the `wgpu::Device`
+  and `wgpu::Queue` your application already uses (`open_sbsar::wgpu` is the wgpu version the
+  crate is built with, currently 30). Nothing is requested from the device; an error names any
+  limit that is too small.
+- **Reuse one renderer**: it keeps the GPU context and the compiled shaders between renders; the
+  first render of a material compiles its shaders, later ones do not.
+- Errors (also internal failures) are returned as `open_sbsar::Error`; `renderer.warnings` lists
+  ignored inputs and unsupported features of the last render.
+- Examples: `lab/sdrt/examples/render.rs` (all outputs to 16-bit PNGs),
+  `lab/sdrt/examples/host_device.rs` (rendering on a host device).
+
+## Command-line tool
+
+```sh
+cargo build --release --manifest-path lab/sdrt/Cargo.toml   # target/release/sdrt
+sdrt render FILE.sbsar OUTDIR            # every output as a 16-bit PNG named after its identifier
+sdrt inputs FILE.sbsar                   # the graph's parameters
+sdrt node FILE.sbsar INDEX OUT.png       # one internal node (OUT.f32: raw RGBA f32)
+sdrt stats FILE.sbsar                    # every node: op, size, value ranges
+    --set '$outputsize=10,10'            # set a parameter (log2 sizes here: 1024²)
+    --backend vulkan                     # the GPU path (the default is the CPU path)
+```
+
+## What is here
+
+| Path | What |
+| --- | --- |
+| `lab/sdrt/` | the `open-sbsar` crate: library (`src/lib.rs`, `src/api.rs`), engine (program parser, node operations, function VM, FX-Maps, text, bitmaps, CPU and GPU paths) and the `sdrt` tool |
+| `lab/sdrt/GPU.md` | the GPU backend: what runs on the GPU and how bit-exactness with the CPU path is kept (a research log) |
+| `tools/write.py` | writes `.sbsar` files from scratch (Python 3, standard library; needs `7z`) |
+| `docs/` | the format specification, draft 1: [SPEC.md](docs/SPEC.md) (container, program binary, execution model), [SPEC-vm.md](docs/SPEC-vm.md) (functions), [SPEC-ops.md](docs/SPEC-ops.md) (node operations), [SPEC-fxmap.md](docs/SPEC-fxmap.md) (FX-Maps, text, SVG, bitmaps) |
 
 ## How it was made
 
@@ -15,47 +93,13 @@ renderer and compared the images pixel by pixel with our engine, then refined th
 they matched. No decompilation, disassembly, shader or API capture, and no reading of the vendor's
 binaries or resources was used at any point.
 
-## What is here
+## Support
 
-| Path | What |
-| --- | --- |
-| `lab/sdrt/` | `sdrt`, the engine (Rust): container and program parser, node operations, the function VM, FX-Maps, text, bitmaps; CPU reference path and an optional Vulkan (wgpu) backend |
-| `lab/sdrt/GPU.md` | state of the Vulkan backend: what runs on the GPU, how bit-exactness with the CPU path is kept, limits (a research log: it refers to test scripts that are not part of this repository) |
-| `tools/write.py` | writes `.sbsar` files from scratch (Python 3, standard library; needs `7z`) |
-| `docs/` | the format specification, draft 1: [SPEC.md](docs/SPEC.md) (container, program binary, execution model), [SPEC-vm.md](docs/SPEC-vm.md) (functions), [SPEC-ops.md](docs/SPEC-ops.md) (node operations), [SPEC-fxmap.md](docs/SPEC-fxmap.md) (FX-Maps, text, SVG, bitmaps) |
+This project is independently developed and funded by a student. If you find it useful, consider
+supporting its development. Donations help cover AI-assisted research, testing, and
+infrastructure costs.
 
-## Accuracy
-
-Measured against Substance's own renderer (version 14.1, its Vulkan engine) at 128² on 227
-real-world material files (not part of this repository): 281,402 of 324,070 image nodes (86.8%)
-identical, and of 1,575 outputs
-1,135 within 1/255, 156 within 0.02, 284 further off. Most of the remaining differences are
-floating-point noise that Substance's own CPU and GPU engines also disagree on, amplified by
-noise/threshold chains; matching its GPU engine exactly is the purpose of the Vulkan backend.
-
-The Vulkan backend (`--features gpu`, `--backend vulkan`) runs about 95% of the nodes of real
-graphs on the GPU and reproduces the CPU path bit for bit, except where it deliberately uses the
-GPU's own transcendental functions (pixel processors, levels' gamma), which measure closer to
-Substance's own GPU engine. Whole files at 1024² render 1.3–56× faster than on the CPU path.
-
-## Build and run
-
-```sh
-cargo build --release --manifest-path lab/sdrt/Cargo.toml                  # CPU only
-cargo build --release --features gpu --manifest-path lab/sdrt/Cargo.toml   # + Vulkan backend
-```
-
-`7z` must be on `PATH` (archives are read with it).
-
-```sh
-sdrt render FILE.sbsar OUTDIR            # every output as a 16-bit PNG named after its identifier
-sdrt node FILE.sbsar INDEX OUT.png       # one node's image (OUT.f32: raw RGBA f32, every bit)
-sdrt nodes FILE.sbsar OUTDIR K...        # several nodes from one run
-sdrt inputs FILE.sbsar                   # the graph's parameters
-sdrt stats FILE.sbsar                    # every node: op, size, value ranges
-    --set '$outputsize=9,9'              # set a parameter (log2 sizes here: 512²)
-    --backend vulkan                     # hybrid GPU execution (build with --features gpu)
-```
+**[Support open-sbsar](https://app.lava.top/wtfmydarling)**
 
 ## License
 
