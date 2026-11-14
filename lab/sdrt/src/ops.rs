@@ -509,9 +509,11 @@ impl<'p> Runtime<'p> {
         if k >= self.p.nodes.len() {
             return early("missing input");
         }
-        const SWITCHES: [&str; 12] = [
+        const SWITCHES: [&str; 14] = [
             "SDRT_XFIDENT", "SDRT_XFAXES", "SDRT_XFUPF", "SDRT_XFMIPF", "SDRT_XFMIPBIAS", "SDRT_XFUPSHIFT",
             "SDRT_XFUPS", "SDRT_XFUNORM", "SDRT_XFBORDER", "SDRT_DSROUND", "SDRT_DSINT", "SDRT_MIPROUND",
+            "SDRT_XFEDGE",
+            "SDRT_XFMIP8",
         ];
         if SWITCHES.iter().any(|s| crate::envc::var(s).is_ok()) {
             return early("experiment switch");
@@ -543,6 +545,9 @@ impl<'p> Runtime<'p> {
             m => Some(m as f32),
         };
         let (m, off) = (&matrix[..4], &offset[..2]);
+        if crate::envc::var("SDRT_STRICT_TRACE").is_ok() {
+            eprintln!("STRICT {{\"k\":{},\"op\":4,\"input\":{k},\"sfmt\":{},\"fmt\":{},\"sw\":{sw},\"sh\":{sh},\"w\":{w},\"h\":{h},\"flags\":{},\"tiling\":{tiling},\"matrix\":{m:?},\"offset\":{off:?},\"manual\":{}}}", n.index, self.p.nodes[k].format(), n.format(), n.flags, manual.map_or("null".into(), |v| v.to_string()));
+        }
         let identity = m == [1.0, 0.0, 0.0, 1.0] && off == [0.0, 0.0];
         let dihedral = off == [0.0, 0.0]
             && ((m[0].abs() == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3].abs() == 1.0)
@@ -574,11 +579,13 @@ impl<'p> Runtime<'p> {
                 return reject(self, "non-power-of-two resize");
             }
             let (mut cw, mut ch) = (sw, sh);
+            let mut sample_fmt = self.p.nodes[k].format();
             // halvings stored in the transformation's own format
             while cw > tw || ch > th {
                 let (ax, ay) = (cw > tw, ch > th);
                 let next = (cw >> usize::from(ax), ch >> usize::from(ay));
-                passes.push(pass(2, axes(ax, ay), (cw, ch), 3, next, src_color, n.format()));
+                passes.push(pass(2, axes(ax, ay), (cw, ch), sample_fmt, next, src_color, n.format()));
+                sample_fmt = n.format();
                 (cw, ch) = next;
             }
             // 2x upsamples interpolated in the source's format, unquantized
@@ -617,12 +624,14 @@ impl<'p> Runtime<'p> {
                     return reject(self, "non-power-of-two mip chain");
                 }
                 fmt = if self.p.nodes[k].op & 0xFE == 0x20 { 3 } else { n.format() };
+                let mut sample_fmt = self.p.nodes[k].format();
                 for _ in 0..level {
                     if cw == 1 && ch == 1 {
                         break;
                     }
                     let next = ((cw / 2).max(1), (ch / 2).max(1));
-                    passes.push(pass(2, axes(cw > 1, ch > 1), (cw, ch), 3, next, src_color, fmt));
+                    passes.push(pass(2, axes(cw > 1, ch > 1), (cw, ch), sample_fmt, next, src_color, fmt));
+                    sample_fmt = fmt;
                     (cw, ch) = next;
                 }
             }
@@ -1073,7 +1082,7 @@ impl<'p> Runtime<'p> {
             false
         };
         let Some(&k) = n.inputs.first() else { return early("missing input") };
-        const SWITCHES: [&str; 9] = ["SDRT_TEXFLOAT", "SDRT_BIL256", "SDRT_DMB", "SDRT_DMBSEAM", "SDRT_DMBPAD", "SDRT_DMBQ", "SDRT_DMBEXT", "SDRT_RESIZE", "SDRT_RESIZEMIP"];
+        const SWITCHES: [&str; 10] = ["SDRT_TEXFLOAT", "SDRT_BIL256", "SDRT_DMB", "SDRT_DMBSEAM", "SDRT_DMBPAD", "SDRT_DMBQ", "SDRT_DMBEXT", "SDRT_RESIZE", "SDRT_RESIZEMIP", "SDRT_DMBRADIUS"];
         if SWITCHES.iter().any(|s| crate::envc::var(s).is_ok()) {
             return early("experiment switch");
         }
@@ -1096,6 +1105,9 @@ impl<'p> Runtime<'p> {
         let ps = self.pixelsize(n, seed);
         let r = inten * w as f32 / 256.0;
         let (dx, dy) = (ang.cos() * ps.0, ang.sin() * ps.1);
+        if crate::envc::var("SDRT_STRICT_TRACE").is_ok() {
+            eprintln!("STRICT {{\"k\":{},\"op\":22,\"input\":{k},\"sfmt\":{},\"fmt\":{},\"sw\":{nw},\"sh\":{nh},\"w\":{w},\"h\":{h},\"flags\":{},\"tiling\":{wrap},\"intensity\":{inten},\"angle_radians\":{ang},\"dx\":{dx},\"dy\":{dy},\"r\":{r}}}", n.index, self.p.nodes[k].format(), n.format(), n.flags);
+        }
         let y_major = dy.abs() >= dx.abs();
         let major = if y_major { dy.abs() } else { dx.abs() };
         let fmt = self.tex_format(k);
@@ -1118,13 +1130,13 @@ impl<'p> Runtime<'p> {
             }
             path = "copy";
         } else {
-            let radius = 0.5 + (r - 0.5) * major;
+            let axis_aligned = dx.abs().min(dy.abs()) < 1e-6;
+            let radius = if axis_aligned { r * major } else { 0.5 + (r - 0.5) * major };
             if !(radius.abs() <= 4096.0) {
                 self.node_vars = saved_vars;
                 return early("non-finite or huge radius");
             }
             let taps = box_taps(radius);
-            let axis_aligned = dx.abs().min(dy.abs()) < 1e-6;
             let desc = [w as u32, h as u32, fmt, u32::from(scolor)];
             if taps.len() <= 3 || axis_aligned {
                 for &(t, wt) in &taps {
@@ -2175,7 +2187,7 @@ impl<'p> Runtime<'p> {
         if let Some(c) = self.mip_cache.get(&(k, fmt)) {
             return c.clone();
         }
-        let mut chain = crate::image::mips(self.img(k), fmt);
+        let mut chain = crate::image::transform_mips(self.img(k), fmt, self.p.nodes[k].format());
         chain.remove(0);
         let rc = std::sync::Arc::new(chain);
         self.mip_cache.insert((k, fmt), rc.clone());
@@ -2588,6 +2600,9 @@ impl<'p> Runtime<'p> {
             m => Some(m as f32),
         };
         let (sw, sh) = (self.img(k).w, self.img(k).h);
+        if crate::envc::var("SDRT_STRICT_TRACE").is_ok() {
+            eprintln!("STRICT {{\"k\":{},\"op\":4,\"input\":{k},\"sfmt\":{},\"fmt\":{},\"sw\":{sw},\"sh\":{sh},\"w\":{w},\"h\":{h},\"flags\":{},\"tiling\":{tiling},\"matrix\":{m:?},\"offset\":{off:?},\"manual\":{}}}", n.index, self.p.nodes[k].format(), n.format(), n.flags, manual.map_or("null".into(), |v| v.to_string()));
+        }
         // Auto-mip (mip = 0x1F) with a signed-permutation matrix ([±1,0,0,±1] or [0,±1,±1,0]) and
         // zero offset resizes per axis via mip halvings / 2× bilinear upsamples and flips/rotates
         // texels (wallpaper 406 m=[-1,0,0,-1], xf_all_probe/xf_ns). Manual mip levels (including
@@ -2619,8 +2634,10 @@ impl<'p> Runtime<'p> {
                     Ok("8") => 0,
                     _ => n.format(),
                 };
+                let mut sample_fmt = self.p.nodes[k].format();
                 while cur.w > tw || cur.h > th {
-                    cur = cur.downsample_axes(cur.w > tw, cur.h > th, mf);
+                    cur = cur.downsample_axes_sampled(cur.w > tw, cur.h > th, mf, sample_fmt);
+                    sample_fmt = mf;
                 }
                 while cur.w < tw || cur.h < th {
                     cur = cur.upsample_axes_fmt(cur.w < tw, cur.h < th, wrap, f);
@@ -2698,6 +2715,7 @@ impl<'p> Runtime<'p> {
         // the format the sampled texels are stored in (an embedded bitmap's mip levels are float)
         let src_fmt = if crate::envc::var("SDRT_XFUNORM").as_deref() == Ok("0") { 3 } else if level > 0 { xf_mip_fmt } else { self.p.nodes[k].format() };
         let border_mode: u32 = crate::envc::var("SDRT_XFBORDER").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let edge_coverage = crate::envc::var("SDRT_XFEDGE").as_deref() != Ok("legacy");
         if crate::envc::var("SDRT_XFDBG").is_ok() {
             eprintln!("xf: out {}x{} src {}x{} img {}x{} level {} lod {} wrap {:?} matte {:?} m {:?} off {:?} bil {}", w, h, sw, sh, img.w, img.h, level, lod_raw, wrap, matte, m, off, bilinear);
         }
@@ -2722,6 +2740,23 @@ impl<'p> Runtime<'p> {
                         // (xfmag.py o1: u = 1.011 still weighs the last texel 0.32)
                         // tiled axes too: the coupled 1/256 cross weight (xfcross.py, random source)
                         if bilinear && border_mode != 2 {
+                            // 14.1 blends the edge-clamped texture with the matte using float
+                            // coverage, separately from the texture unit's 1/256 weights.
+                            // Measured by strict_xf/probe/edges.sbsar (all tilings, mip 0/2,
+                            // UNORM/float, nonzero matte). The interior sampler is unchanged.
+                            if edge_coverage {
+                                if let Some(matte) = border {
+                                    let (tx, ty) = (u * img.w as f32 - 0.5, v * img.h as f32 - 0.5);
+                                    let cx = if wrap.0 { 1.0 } else { (tx + 1.0).min(img.w as f32 - tx).clamp(0.0, 1.0) };
+                                    let cy = if wrap.1 { 1.0 } else { (ty + 1.0).min(img.h as f32 - ty).clamp(0.0, 1.0) };
+                                    let coverage = cx * cy;
+                                    if coverage == 0.0 { return matte; }
+                                    if coverage < 1.0 {
+                                        let p = img.bilinear_or(u, v, wrap, None, src_fmt);
+                                        return std::array::from_fn(|c| p[c] * coverage + matte[c] * (1.0 - coverage));
+                                    }
+                                }
+                            }
                             img.bilinear_or(u, v, wrap, border, src_fmt)
                         } else if outside {
                             if color { [matte[0], matte[1], matte[2], matte[3]] } else { Image::gray(matte[0]) }
@@ -3339,7 +3374,12 @@ impl<'p> Runtime<'p> {
         if major == 0.0 {
             return (*src).clone();
         }
-        let radius = 0.5 + (r - 0.5) * major;
+        let axis_aligned = dx.abs().min(dy.abs()) < 1e-6;
+        // On an exact axis, pixelsize scales the entire radius. The half-texel
+        // shear correction applies only off-axis (strict_xf/probe/motion.sbsar).
+        let radius = if axis_aligned && crate::envc::var("SDRT_DMBRADIUS").as_deref() != Ok("legacy") {
+            r * major
+        } else { 0.5 + (r - 0.5) * major };
         let taps = box_taps(radius);
         // SDRT_DMB: "pair" = the box pass with blur's paired bilinear fetches; "tex" = texture-unit
         // samples (coupled weights, UNORM integers); "all" = both
@@ -3351,7 +3391,6 @@ impl<'p> Runtime<'p> {
         // SD does not build the two shear passes for the one-/three-tap
         // kernels.  It samples each major-axis tap directly instead.  This
         // also preserves the established axis-aligned path.
-        let axis_aligned = dx.abs().min(dy.abs()) < 1e-6;
         if taps.len() <= 3 || axis_aligned {
             let mut o = Image::new(w, h, n.color, [0.0; 4]);
             use rayon::prelude::*;

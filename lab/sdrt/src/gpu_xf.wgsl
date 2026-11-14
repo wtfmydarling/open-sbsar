@@ -184,7 +184,7 @@ fn halve_pixel(k: u32) -> vec4<f32> {
         }
     }
     let n = nx * ny;
-    if config.options.x == 1u {
+    if config.options.x == 1u || (config.options.x == 0u && source_desc().z <= 1u) {
         let q = (sum + vec4<u32>(n / 2u)) / vec4<u32>(n);
         return vec4<f32>(unorm_float(q.x, 16u), unorm_float(q.y, 16u), unorm_float(q.z, 16u), unorm_float(q.w, 16u));
     }
@@ -224,6 +224,28 @@ fn transform_pixel(k: u32) -> vec4<f32> {
     let wrap_y = (config.header.w & 2u) != 0u;
     let bilinear = (config.header.w & 4u) != 0u;
     let clamp_border = (config.header.w & 8u) != 0u;
+    // Untiled edges blend an edge-clamped texture sample with the matte using float
+    // coverage. Texture interpolation still uses the coupled 1/256 weights above.
+    if bilinear && !clamp_border && !(wrap_x && wrap_y) {
+        // Keep the subtraction rounded before coverage adds 1.0; otherwise the
+        // compiler reassociates (u * size - 0.5) + 1.0 into u * size + 0.5.
+        let tx = barrier(barrier(u * f32(source_desc().x)) - 0.5);
+        let ty = barrier(barrier(v * f32(source_desc().y)) - 0.5);
+        var cx = 1.0;
+        var cy = 1.0;
+        if !wrap_x { cx = clamp(min(tx + 1.0, f32(source_desc().x) - tx), 0.0, 1.0); }
+        if !wrap_y { cy = clamp(min(ty + 1.0, f32(source_desc().y) - ty), 0.0, 1.0); }
+        let coverage = barrier(cx * cy);
+        if coverage == 0.0 { return config.extra; }
+        if coverage < 1.0 {
+            let p = sample(u, v, true, wrap_x, wrap_y, true, config.extra);
+            return vec4<f32>(
+                barrier(p.x * coverage) + barrier(config.extra.x * (1.0 - coverage)),
+                barrier(p.y * coverage) + barrier(config.extra.y * (1.0 - coverage)),
+                barrier(p.z * coverage) + barrier(config.extra.z * (1.0 - coverage)),
+                barrier(p.w * coverage) + barrier(config.extra.w * (1.0 - coverage)));
+        }
+    }
     return sample(u, v, bilinear, wrap_x, wrap_y, clamp_border, config.extra);
 }
 

@@ -192,6 +192,12 @@ impl Image {
 
     /// Half the size along the chosen axes: the average of each texel pair, stored in `format`.
     pub fn downsample_axes(&self, along_x: bool, along_y: bool, format: u32) -> Image {
+        self.downsample_axes_sampled(along_x, along_y, format, 3)
+    }
+
+    /// Transformation halvings sample UNORM sources in 16-bit integer space before
+    /// storing the result. An 8-bit target still uses its normal storage quantization.
+    pub fn downsample_axes_sampled(&self, along_x: bool, along_y: bool, format: u32, source_format: u32) -> Image {
         use rayon::prelude::*;
         let (nx, ny) = (1 + along_x as usize, 1 + along_y as usize);
         let (w, h) = (self.w / nx, self.h / ny);
@@ -207,6 +213,7 @@ impl Image {
             Ok("all") | Ok("1") => format <= 1,
             _ => format == 1,
         };
+        let tex16 = format == 0 && source_format <= 1 && crate::envc::var("SDRT_XFMIP8").as_deref() != Ok("legacy");
         o.px.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
             for x in 0..w {
                 let mut acc = [0.0f32; 4];
@@ -224,9 +231,9 @@ impl Image {
                         "up" => (t + 0.5).floor(), _ => t.round() }) / m };
                     row[x] = row[x].map(f);
                 }
-                if ds_int {
+                if ds_int || tex16 {
                     // integer average of the stored codes, ties up (a GPU mip generator)
-                    let (m, n) = (if format == 0 { 255.0 } else { 65535.0 }, (nx * ny) as u32);
+                    let (m, n) = (if format == 0 && !tex16 { 255.0 } else { 65535.0 }, (nx * ny) as u32);
                     let mut sum = [0u32; 4];
                     for dy in 0..ny { for dx in 0..nx {
                         let p = self.at(x * nx + dx, y * ny + dy);
@@ -391,6 +398,24 @@ pub fn mips(img: &Image, format: u32) -> Vec<Image> {
         });
         o.quantize(format);
         v.push(o);
+    }
+    v
+}
+
+/// Transformation-specific mip generation. An 8-bit level reads UNORM texels via
+/// a 16-bit rounded average, then quantizes to UNORM8 (strict_xf/probe/edges.sbsar).
+/// Other mip consumers retain their independently measured rules.
+pub fn transform_mips(img: &Image, format: u32, source_format: u32) -> Vec<Image> {
+    if format != 0 || crate::envc::var("SDRT_XFMIP8").as_deref() == Ok("legacy") || crate::envc::var("SDRT_MIPROUND").is_ok() {
+        return mips(img, format);
+    }
+    let mut v = vec![img.clone()];
+    let mut sf = source_format;
+    while v.last().unwrap().w > 1 || v.last().unwrap().h > 1 {
+        let s = v.last().unwrap();
+        let next = s.downsample_axes_sampled(s.w > 1, s.h > 1, format, sf);
+        v.push(next);
+        sf = format;
     }
     v
 }

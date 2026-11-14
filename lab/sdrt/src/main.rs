@@ -332,6 +332,14 @@ fn main() {
                 }
                 Ok(())
             }
+            Some("output-nodes") if args.len() == 2 => {
+                let (b, _) = load(Path::new(&args[1]))?;
+                let p = Program::parse(b)?;
+                for o in &p.outputs {
+                    if o.flags & 0x10000 != 0 { println!("{}", o.node); }
+                }
+                Ok(())
+            }
             Some("ops") if args.len() == 2 => {
                 // one line per node: index, op, flags, color (for tools/sdvers.py)
                 let (b, _) = load(Path::new(&args[1]))?;
