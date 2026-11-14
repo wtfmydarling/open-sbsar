@@ -204,12 +204,16 @@ fn s_div(a: f32, b: f32) -> f32 {
     return q;
 }
 
-// image.rs "resized" (default mode): "bilinear" at the output's pixel centres, edges clamped.
-// The output size is the pass size (powers of two: the divisions are exact).
+// image.rs "resized" / "resized_fmt" (default mode): UNORM formats <= 1 interpolate in 16-bit
+// integers with coupled 1/256 weights ("bilinear_or"), float formats use "bilinear" at the
+// output's pixel centres, edges clamped. The output size is the pass size (powers of two).
 fn s_resize_pixel(k: u32) -> vec4<f32> {
     let w = config.header.z;
     let h = config.header.y / w;
     let u = (f32(k % w) + 0.5) / f32(w);
     let v = (f32(k / w) + 0.5) / f32(h);
+    if config.selectors.z <= 1u {
+        return s_bilinear_or(0u, config.selectors, u, v, vec2<bool>(false, false));
+    }
     return s_bilinear_256(0u, config.selectors, u, v, vec2<bool>(false, false));
 }

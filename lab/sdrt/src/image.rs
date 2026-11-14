@@ -269,6 +269,12 @@ impl Image {
 
     /// Resample to another size by bilinear sampling at the new pixel centres.
     pub fn resized(&self, w: usize, h: usize) -> Image {
+        self.resized_fmt(w, h, 3)
+    }
+
+    /// Resample to another size in the source's texture format (UNORM formats ≤ 1 interpolate in
+    /// 16-bit integers with coupled 1/256 weights, as the GPU texture unit).
+    pub fn resized_fmt(&self, w: usize, h: usize, format: u32) -> Image {
         if (w, h) == (self.w, self.h) {
             return self.clone();
         }
@@ -280,7 +286,7 @@ impl Image {
             while cur.w >= 2 * w || cur.h >= 2 * h {
                 cur = cur.downsample_axes(cur.w >= 2 * w, cur.h >= 2 * h, 3);
             }
-            return cur.resized(w, h);
+            return cur.resized_fmt(w, h, format);
         }
         let mut o = Image::new(w, h, self.color, [0.0; 4]);
         // an input of another size is resampled with its edges clamped (waterdamagedconcrete blends
@@ -288,10 +294,11 @@ impl Image {
         // SDRT_RESIZE=wrap: the old wrap; tex[clamp|wrap]: the texture unit's UNORM interpolation (test)
         let mode = crate::env_once!("SDRT_RESIZE").unwrap_or("clamp");
         let wrap = mode.contains("wrap");
+        let use_tex = mode.starts_with("tex") || (format <= 1 && mode != "float");
         for y in 0..h {
             for x in 0..w {
                 let (u, v) = ((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
-                o.px[y * w + x] = if mode.starts_with("tex") { self.bilinear_or(u, v, (wrap, wrap), None, 1) } else { self.bilinear(u, v, (wrap, wrap)) };
+                o.px[y * w + x] = if use_tex { self.bilinear_or(u, v, (wrap, wrap), None, 1) } else { self.bilinear(u, v, (wrap, wrap)) };
             }
         }
         o

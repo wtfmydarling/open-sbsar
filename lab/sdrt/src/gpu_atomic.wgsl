@@ -35,6 +35,22 @@ fn blend_channel(b:f32,f:f32,mode:u32)->f32 {
         default: {return f;}
     }
 }
+fn atomic_half_trunc(v:f32)->f32 {
+    if !finite_bits(v) {return v;}
+    let bits=bitcast<u32>(v);let sign=bits&0x80000000u;
+    let e=i32((bits>>23u)&255u)-127;
+    if e>15 {return bitcast<f32>(sign|0x477fe000u);}
+    if e< -24 {return bitcast<f32>(sign);}
+    let shift=u32(23-min(10,24+e));
+    return bitcast<f32>(bits&~((1u<<shift)-1u));
+}
+fn atomic_store(k:u32,p:vec4<f32>) {
+    if config.options.x==2u {
+        store(k,vec4<f32>(atomic_half_trunc(p.x),atomic_half_trunc(p.y),atomic_half_trunc(p.z),atomic_half_trunc(p.w)));
+        return;
+    }
+    store(k,p);
+}
 // The GPU's mix: b·(1 − t) + f·t (ops.rs "blend", lerp). The sum 1 − t feeds a product: the
 // driver would distribute the factor b over it.
 fn mix_layers(a:f32,b:f32,t:f32)->f32 {return barrier(a*barrier(1.0-t))+barrier(b*t);}
@@ -44,7 +60,15 @@ fn blend_pixel(k:u32)->vec4<f32> {
     let crop=config.selectors;
     if config.values.y!=0.0 && (x<crop.x || y<crop.y || x>=crop.z || y>=crop.w) {return b;}
     var opacity=config.values.x;
-    if config.options.w>2u {opacity=barrier(opacity*image_pixel(2u,k).x);}
+    if config.options.w>2u {
+        var m=image_pixel(2u,k).x;
+        // A cropped opacity mask is rendered into a temporary mask buffer of the blend node's own
+        // format before multiplying by opacitymult (sovietfloortile 3096; probe_blend_crop.py).
+        if config.values.y!=0.0 {
+            if config.options.x==2u {m=atomic_half_trunc(m);} else {m=quantize(m);}
+        }
+        opacity=barrier(opacity*m);
+    }
     opacity=rs_clamp(opacity,0.0,1.0);
     let mode=config.header.w&15u;let alpha_mode=(config.header.w>>11u)&3u;
     if config.options.y==0u {return vec4<f32>(mix_layers(b.x,blend_channel(b.x,f.x,mode),opacity));}
@@ -144,8 +168,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if config.header.x==7u {store(k,s_resize_pixel(k));return;}
     if config.header.x==5u {store(k,normal_pixel(k));return;}
     if config.header.x==6u {store(k,sharpen_pixel(k));return;}
-    if config.header.x==3u {store(k,levels_pixel(k));return;}
-    if config.header.x==4u {store(k,blend_pixel(k));return;}
+    if config.header.x==3u {atomic_store(k,levels_pixel(k));return;}
+    if config.header.x==4u {atomic_store(k,blend_pixel(k));return;}
     if config.header.x == 0u {
         store(k, config.values);
     } else if config.header.x == 1u {

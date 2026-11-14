@@ -336,6 +336,13 @@ impl<'p> Runtime<'p> {
         if (im.w, im.h) == (w, h) { im.clone() } else { std::sync::Arc::new(im.resized(w, h)) }
     }
 
+    /// Input i at the node's size, resampled in its texture format (UNORM formats ≤ 1 interpolate
+    /// in 16-bit integers with coupled 1/256 weights, as the texture unit).
+    fn input_at_fmt(&self, i: usize, w: usize, h: usize) -> std::sync::Arc<Image> {
+        let im = self.images[i].as_ref().expect("input computed");
+        if (im.w, im.h) == (w, h) { im.clone() } else { std::sync::Arc::new(im.resized_fmt(w, h, self.tex_format(i))) }
+    }
+
     /// Run every node. Images no longer needed are dropped unless `keep_all`.
     pub fn run(&mut self, keep_all: bool) {
         self.run_inner(keep_all, None)
@@ -1946,12 +1953,12 @@ impl<'p> Runtime<'p> {
 
     fn blend(&mut self, n: &Node, seed: u32) -> Image {
         let (w, h) = n.size();
-        let bg = self.input_at(n.inputs[0], w, h);
-        let fg = self.input_at(n.inputs[1], w, h);
+        let bg = self.input_at_fmt(n.inputs[0], w, h);
+        let fg = self.input_at_fmt(n.inputs[1], w, h);
         let mode = n.flags & 0xF;
         let alpha_mode = (n.flags >> 11) & 3;
         let (op_img, op_const) = match n.param("opacity") {
-            Slot::Input(k) => (Some(self.input_at(*k, w, h)), self.param(n, "opacitymult", seed).map_or(1.0, |v| v[0])),
+            Slot::Input(k) => (Some(self.input_at_fmt(*k, w, h)), self.param(n, "opacitymult", seed).map_or(1.0, |v| v[0])),
             s => (None, self.slot(&s.clone(), seed).map_or(1.0, |v| v[0])),
         };
         // the Cropping area: (x0, y0) (x1, y1) as u16/32768; pixels floor(x0·w) ≤ x < floor(x1·w)
@@ -1987,9 +1994,12 @@ impl<'p> Runtime<'p> {
         // down); SDRT_MIX=old for b + (f − b)·t
         let old_mix = crate::envc::var("SDRT_MIX").as_deref() == Ok("old");
         let lerp = |a: f32, b: f32, t: f32| if old_mix { a + (b - a) * t } else { a * (1.0 - t) + b * t };
+        let fmt = n.format();
+        let half_rne = crate::env_once!("SDRT_HALF").as_deref() == Ok("rne");
+        let crop_q = crop.is_some() && crate::env_once!("SDRT_CROPQ").as_deref() != Ok("0");
         use rayon::prelude::*;
         let color = n.color;
-        let px: Vec<[f32; 4]> = (0..w * h)
+        let mut px: Vec<[f32; 4]> = (0..w * h)
             .into_par_iter()
             .map(|k| {
             let (pb, pf) = (bg.px[k], fg.px[k]);
@@ -1999,8 +2009,24 @@ impl<'p> Runtime<'p> {
                     return pb;
                 }
             }
+            // A cropped opacity mask is rendered into a temporary mask buffer of the blend node's
+            // own format before multiplying by opacitymult (sovietfloortile 3096; probe_blend_crop.py).
+            let op_m = op_img.as_ref().map_or(1.0, |im| {
+                let m = im.px[k][0];
+                if crop_q {
+                    match fmt {
+                        0 => crate::image::unorm(m, 8) as f32 / 255.0,
+                        1 => crate::image::unorm(m, 16) as f32 / 65535.0,
+                        2 if !half_rne => crate::image::half_trunc(m),
+                        2 => crate::image::half(m),
+                        _ => m,
+                    }
+                } else {
+                    m
+                }
+            });
             // the opacity is clamped to [0, 1] (scratch/fb/blendop.py: 9, 3, 1.5 act as 1; −0.5 as 0)
-            let op = (op_const * op_img.as_ref().map_or(1.0, |im| im.px[k][0])).clamp(0.0, 1.0);
+            let op = (op_const * op_m).clamp(0.0, 1.0);
             if !color {
                 return Image::gray(lerp(pb[0], f(pb[0], pf[0]), op));
             }
@@ -2050,12 +2076,19 @@ impl<'p> Runtime<'p> {
             c
             })
             .collect();
+        // Half-float blend and levels nodes truncate toward zero on storage (cream-leather-01 138;
+        // probe_half.py), just like 16F FX-Maps and gradient maps.
+        if fmt == 2 && !half_rne {
+            for p in &mut px {
+                *p = if color { p.map(crate::image::half_trunc) } else { Image::gray(crate::image::half_trunc(p[0])) };
+            }
+        }
         Image { w, h, color, px }
     }
 
     fn levels(&mut self, n: &Node, seed: u32) -> Image {
         let (w, h) = n.size();
-        let src = self.input_at(n.inputs[0], w, h);
+        let src = self.input_at_fmt(n.inputs[0], w, h);
         let nc = if n.color { 4 } else { 1 };
         let get = |rt: &mut Self, name: &str, d: f32| -> Vec<f32> { rt.param(n, name, seed).unwrap_or(vec![d; nc]) };
         let (il, ih, im, ol, oh) = (get(self, "inlow", 0.0), get(self, "inhigh", 1.0), get(self, "inmid", 0.5), get(self, "outlow", 0.0), get(self, "outhigh", 1.0));
@@ -2094,6 +2127,11 @@ impl<'p> Runtime<'p> {
             }
             *out = if n.color { q } else { Image::gray(q[0]) };
         });
+        if n.format() == 2 && crate::env_once!("SDRT_HALF").as_deref() != Ok("rne") {
+            for p in &mut o.px {
+                *p = if n.color { p.map(crate::image::half_trunc) } else { Image::gray(crate::image::half_trunc(p[0])) };
+            }
+        }
         o
     }
 

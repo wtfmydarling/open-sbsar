@@ -62,25 +62,42 @@ pub struct Gpu {
 impl Gpu {
     pub fn new() -> Result<Self, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..Default::default() });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .ok_or("no Vulkan adapter")?;
-        let info = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu {
-            return Err("Vulkan selected a software CPU adapter; hardware GPU required".into());
-        }
-        let mut required_limits = wgpu::Limits::default();
-        let ad_limits = adapter.limits();
-        required_limits.max_storage_buffer_binding_size = ad_limits.max_storage_buffer_binding_size;
-        required_limits.max_buffer_size = ad_limits.max_buffer_size;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor { label: Some("sdrt"), required_features: wgpu::Features::empty(), required_limits },
-            None,
-        ))
-        .map_err(|e| e.to_string())?;
+        let (info, device, queue) = {
+            let mut last_err = String::new();
+            let mut res = None;
+            for _ in 0..100 {
+                let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })) else {
+                    last_err = "no Vulkan adapter".into();
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    continue;
+                };
+                let info = adapter.get_info();
+                if info.device_type == wgpu::DeviceType::Cpu {
+                    return Err("Vulkan selected a software CPU adapter; hardware GPU required".into());
+                }
+                let mut required_limits = wgpu::Limits::default();
+                let ad_limits = adapter.limits();
+                required_limits.max_storage_buffer_binding_size = ad_limits.max_storage_buffer_binding_size;
+                required_limits.max_buffer_size = ad_limits.max_buffer_size;
+                let dq = pollster::block_on(adapter.request_device(
+                    &wgpu::DeviceDescriptor { label: Some("sdrt"), required_features: wgpu::Features::empty(), required_limits },
+                    None,
+                ));
+                drop(adapter);
+                match dq {
+                    Ok((device, queue)) => { res = Some((info, device, queue)); break; }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                }
+            }
+            res.ok_or(last_err)?
+        };
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sdrt basic atomic nodes"),
