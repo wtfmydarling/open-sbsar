@@ -168,6 +168,10 @@ pub struct InputImage {
     pub channels: usize,
     /// pixel values in 0..1 (HDR allowed), row-major, `width * height * channels` values
     pub data: Vec<f32>,
+    /// the storage of the source file: `U8` / `U16` values are the integer codes divided by
+    /// 255 / 65535 and are interpolated as integers when the image is resized, `F16` / `F32`
+    /// as floats
+    pub storage: PixelFormat,
 }
 
 /// Input values for a render. Inputs that are not set keep the graph's defaults.
@@ -186,8 +190,8 @@ impl Parameters {
         self.values.push((identifier.to_string(), value));
         self
     }
-    /// Connect an image input. (Image inputs are not evaluated yet in this version: see
-    /// `Renderer::render`'s warnings.)
+    /// Connect an image input (the graph-input nodes read it, resized to their size as
+    /// Substance does).
     pub fn set_image(&mut self, identifier: &str, image: InputImage) -> &mut Self {
         self.images.retain(|(i, _)| i != identifier);
         self.images.push((identifier.to_string(), image));
@@ -358,8 +362,22 @@ impl Renderer {
             };
             rt.inputs.insert(uid, v);
         }
-        for (id, _) in &params.images {
-            warnings.push(format!("image input {id}: image inputs are not evaluated in this version"));
+        for (id, im) in &params.images {
+            let Some(uid) = uids.iter().find(|(i, _)| i == id).map(|(_, u)| *u) else {
+                warnings.push(format!("no input {id}: ignored"));
+                continue;
+            };
+            let ch = im.channels;
+            if !(ch == 1 || ch == 4) || im.data.len() != im.width * im.height * ch || im.width == 0 || im.height == 0 {
+                warnings.push(format!("image input {id}: expected width * height * channels (1 or 4) values: ignored"));
+                continue;
+            }
+            let mut img = crate::image::Image::new(im.width, im.height, ch == 4, [0.0; 4]);
+            for (k, q) in img.px.iter_mut().enumerate() {
+                *q = if ch == 4 { [im.data[k * 4], im.data[k * 4 + 1], im.data[k * 4 + 2], im.data[k * 4 + 3]] } else { crate::image::Image::gray(im.data[k]) };
+            }
+            let fmt = match im.storage { PixelFormat::U8 => 0, PixelFormat::U16 => 1, PixelFormat::F16 | PixelFormat::F32 => 3 };
+            rt.set_image(uid, img, fmt);
         }
         let nodes: Vec<(usize, &OutputInfo)> = wanted
             .iter()

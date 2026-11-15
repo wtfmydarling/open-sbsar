@@ -18,9 +18,48 @@ fn output_names(xml: &str) -> Vec<(u32, String)> {
     package::output_names(xml)
 }
 
+/// An image input file (PNG, TIFF, EXR, ...) as RGBA f32 (`color` = false only for a one-channel gray file): integer files are v / (2^bits - 1),
+/// gray files repeat the value in R, G, B, and files without alpha get alpha 1.
+fn load_image(path: &Path) -> Result<(image::Image, u32), String> {
+    use ::image::DynamicImage as D;
+    let d = ::image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (w, h) = (d.width() as usize, d.height() as usize);
+    // exact v / 255, v / 65535 (the image crate's own luma conversions multiply by 1/255)
+    let u8c = |v: u8| v as f32 / 255.0;
+    let u16c = |v: u16| v as f32 / 65535.0;
+    let px: Vec<[f32; 4]> = match &d {
+        D::ImageLuma8(i) => i.pixels().map(|p| { let g = u8c(p.0[0]); [g, g, g, 1.0] }).collect(),
+        D::ImageLumaA8(i) => i.pixels().map(|p| { let g = u8c(p.0[0]); [g, g, g, u8c(p.0[1])] }).collect(),
+        D::ImageRgb8(i) => i.pixels().map(|p| [u8c(p.0[0]), u8c(p.0[1]), u8c(p.0[2]), 1.0]).collect(),
+        D::ImageRgba8(i) => i.pixels().map(|p| p.0.map(u8c)).collect(),
+        D::ImageLuma16(i) => i.pixels().map(|p| { let g = u16c(p.0[0]); [g, g, g, 1.0] }).collect(),
+        D::ImageLumaA16(i) => i.pixels().map(|p| { let g = u16c(p.0[0]); [g, g, g, u16c(p.0[1])] }).collect(),
+        D::ImageRgb16(i) => i.pixels().map(|p| [u16c(p.0[0]), u16c(p.0[1]), u16c(p.0[2]), 1.0]).collect(),
+        D::ImageRgba16(i) => i.pixels().map(|p| p.0.map(u16c)).collect(),
+        _ => d.to_rgba32f().pixels().map(|p| p.0).collect(),
+    };
+    let mut img = image::Image::new(w, h, d.color().has_color() || d.color().has_alpha(), [0.0; 4]);
+    img.px = px;
+    let fmt = match &d {
+        D::ImageLuma8(_) | D::ImageLumaA8(_) | D::ImageRgb8(_) | D::ImageRgba8(_) => 0,
+        D::ImageLuma16(_) | D::ImageLumaA16(_) | D::ImageRgb16(_) | D::ImageRgba16(_) => 1,
+        _ => 3,
+    };
+    Ok((img, fmt))
+}
+
 /// Apply `--set ID=v[,v…]` options to the runtime's inputs (ints for int inputs, floats else).
-fn apply_sets(rt: &mut ops::Runtime, xml: &str, sets: &[String]) -> Result<(), String> {
+fn apply_sets(rt: &mut ops::Runtime, xml: &str, sets: &[String], images: &[String]) -> Result<(), String> {
     let uids = package::input_uids(xml);
+    for s in images {
+        let (id, path) = s.split_once('=').ok_or("--set-image IDENT=path")?;
+        let Some(uid) = uids.iter().find(|(i, _)| i == id).map(|(_, u)| *u) else {
+            eprintln!("warning: no input {id}, ignored");
+            continue;
+        };
+        let (img, fmt) = load_image(Path::new(path))?;
+        rt.set_image(uid, img, fmt);
+    }
     for (uid, d) in package::string_defaults(xml) {
         rt.strings.insert(uid, d);
     }
@@ -77,6 +116,12 @@ fn main() {
         sets.push(args.remove(k + 1));
         args.remove(k);
     }
+    let mut set_images = vec![];
+    while let Some(k) = args.iter().position(|a| a == "--set-image") {
+        if k + 1 >= args.len() { eprintln!("--set-image requires IDENT=path"); std::process::exit(2); }
+        set_images.push(args.remove(k + 1));
+        args.remove(k);
+    }
     let backend = if let Some(k) = args.iter().position(|a| a == "--backend") {
         args.remove(k);
         if k >= args.len() { eprintln!("--backend requires cpu or vulkan"); std::process::exit(2); }
@@ -91,7 +136,7 @@ fn main() {
                 let names = output_names(&xml);
                 let mut rt = ops::Runtime::new(&p);
                 if backend == "vulkan" { rt.enable_gpu()?; }
-                apply_sets(&mut rt, &xml, &sets)?;
+                apply_sets(&mut rt, &xml, &sets, &set_images)?;
                 rt.run(false);
                 std::fs::create_dir_all(&args[2]).map_err(|e| e.to_string())?;
                 for o in &p.outputs {
@@ -108,7 +153,7 @@ fn main() {
                 let k: usize = args[2].parse().map_err(|_| "bad node index")?;
                 let mut rt = ops::Runtime::new(&p);
                 if backend == "vulkan" { rt.enable_gpu()?; }
-                apply_sets(&mut rt, &xml, &sets)?;
+                apply_sets(&mut rt, &xml, &sets, &set_images)?;
                 rt.run_for(&[k]);
                 save(rt.images[k].as_ref().ok_or("not computed")?, Path::new(&args[3]))?;
                 report(&rt);
@@ -121,7 +166,7 @@ fn main() {
                 let ks: Vec<usize> = args[3..].iter().filter_map(|a| a.parse().ok()).collect();
                 let mut rt = ops::Runtime::new(&p);
                 if backend == "vulkan" { rt.enable_gpu()?; }
-                apply_sets(&mut rt, &xml, &sets)?;
+                apply_sets(&mut rt, &xml, &sets, &set_images)?;
                 std::fs::create_dir_all(&args[2]).map_err(|e| e.to_string())?;
                 // each node is written as soon as it is computed (memory stays bounded; a run cut
                 // short by a timeout still leaves the nodes done so far). SDRT_NODES_F32=1 writes
@@ -141,7 +186,7 @@ fn main() {
                 let p = Program::parse(b)?;
                 let mut rt = ops::Runtime::new(&p);
                 if backend == "vulkan" { rt.enable_gpu()?; }
-                apply_sets(&mut rt, &xml, &sets)?;
+                apply_sets(&mut rt, &xml, &sets, &set_images)?;
                 rt.run(true);
                 for (k, im) in rt.images.iter().enumerate() {
                     let Some(im) = im else { continue };

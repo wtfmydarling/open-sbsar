@@ -47,6 +47,9 @@ pub struct Runtime<'p> {
     pub inputs: HashMap<u32, Value>,
     /// String inputs (interface type 6) by uid: the XML default, or --set (a text node's string).
     pub strings: HashMap<u32, String>,
+    /// Image inputs (interface type 5) supplied by the caller, by input uid: the op 0x20 nodes
+    /// that read a graph input use them (`set_image`); unset inputs use the XML/program default.
+    pub image_inputs: HashMap<u32, (std::sync::Arc<Image>, u32)>,
     pub images: Vec<Option<std::sync::Arc<Image>>>,
     pub vp: HashMap<usize, Value>,
     /// value-processor output slots (op 6's second operand) → value
@@ -236,6 +239,7 @@ impl<'p> Runtime<'p> {
             gpu: None,
             inputs: p.defaults.clone(),
             strings: HashMap::new(),
+            image_inputs: HashMap::new(),
             images: vec![None; p.nodes.len()],
             vp: HashMap::new(),
             vp_slots: HashMap::new(),
@@ -3658,10 +3662,19 @@ impl<'p> Runtime<'p> {
         keys
     }
 
+    /// Supply the image of image input `uid` (any size, RGBA f32 as decoded from the file).
+    /// `format` is the storage of the file: 0 8-bit, 1 16-bit, 3 float.
+    pub fn set_image(&mut self, uid: u32, img: Image, format: u32) {
+        self.image_inputs.insert(uid, (std::sync::Arc::new(img), format));
+    }
+
     fn bitmap(&mut self, n: &Node) -> Image {
         let (w, h) = n.size();
         let p = self.p;
         if n.b3 == 0 {
+            if let Some((img, sf)) = self.image_inputs.get(&(n.data as u32)).cloned() {
+                return input_image(&img, sf, n.color, n.format(), w, h);
+            }
             // graph input image: no image is given, use its default (v8+) or transparent black
             let v = self.inputs.get(&(n.data as u32)).map(|v| v.fv()).unwrap_or([0.0; 4]);
             return Image::new(w, h, n.color, if n.color { v } else { Image::gray(v[0]) });
@@ -4394,6 +4407,130 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
         }
     };
     (f(h + 1.0 / 3.0), f(h), f(h - 1.0 / 3.0))
+}
+
+/// A caller-supplied image input as the graph-input node (`color`, format `fmt`, w x h) sees it:
+/// a gray node reads a color file as the mean of R, G, B (a one-channel file as it is), the alpha
+/// is the file's (1 without one); a half-float node stores the values rounded toward zero.
+fn input_image(src: &Image, sfmt: u32, color: bool, fmt: u32, w: usize, h: usize) -> Image {
+    let third = 1.0f32 / 3.0;
+    // a gray node of a colour file resizes the colour image first and takes the mean after
+    let late_gray = !color && src.color && crate::envc::var("SDRT_II_GRAY").as_deref() != Ok("early");
+    let mut img = Image::new(src.w, src.h, color || late_gray, [0.0; 4]);
+    for (q, p) in img.px.iter_mut().zip(&src.px) {
+        *q = if color || late_gray {
+            *p
+        } else if !src.color {
+            Image::gray(p[0])
+        } else {
+            // a dot product with 1/3: G times it, then R and B fused multiply-adds
+            Image::gray(p[2].mul_add(third, p[0].mul_add(third, p[1] * third)))
+        };
+        if fmt == 2 && !late_gray {
+            *q = q.map(crate::image::half_trunc);
+        }
+    }
+    let mut out = input_resize(img, sfmt, fmt, w, h);
+    if late_gray {
+        let mut g = Image::new(out.w, out.h, false, [0.0; 4]);
+        for (q, p) in g.px.iter_mut().zip(&out.px) {
+            let v = p[2].mul_add(third, p[0].mul_add(third, p[1] * third));
+            *q = Image::gray(v);
+            if fmt == 2 { *q = q.map(crate::image::half_trunc); }
+        }
+        out = g;
+    }
+    out
+}
+
+fn input_resize(img: Image, sfmt: u32, fmt: u32, w: usize, h: usize) -> Image {
+    if (img.w, img.h) == (w, h) {
+        return img;
+    }
+    let mode = crate::envc::var("SDRT_II_MODE").unwrap_or_default();
+    if mode == "resize" {
+        return img.resized(w, h);
+    }
+    // Per axis the file is first resampled to s1 = the node size times a power of two nearest
+    // to the file's size (the largest not above it when downsizing, the smallest not below it
+    // when upsizing): a bilinear at the new pixel centres from the file held in a power-of-two
+    // texture (zero fill, clamped edges). The resize chain below continues from s1.
+    let pick = |len: usize, node: usize| -> usize {
+        let mut s1 = node;
+        if len >= node {
+            while s1 * 2 <= len { s1 *= 2; }
+        } else {
+            while s1 / 2 >= len { s1 /= 2; }
+        }
+        s1
+    };
+    let (s1x, s1y) = (pick(img.w, w), pick(img.h, h));
+    let resampled = (s1x, s1y) != (img.w, img.h);
+    let img = if !resampled {
+        img
+    } else {
+        let (pw, ph) = (img.w.next_power_of_two(), img.h.next_power_of_two());
+        let mut pad = Image::new(pw, ph, img.color, [0.0; 4]);
+        for y in 0..img.h {
+            for x in 0..img.w {
+                pad.px[y * pw + x] = img.px[y * img.w + x];
+            }
+        }
+        let (fx, fy) = (img.w as f32 / s1x as f32, img.h as f32 / s1y as f32);
+        let mut o = Image::new(s1x, s1y, img.color, [0.0; 4]);
+        for y in 0..s1y {
+            for x in 0..s1x {
+                o.px[y * s1x + x] = pad.bilinear_or((x as f32 + 0.5) * fx / pw as f32, (y as f32 + 0.5) * fy / ph as f32, (false, false), None, sfmt);
+            }
+        }
+        if !mode.contains("noq1") { o.quantize(fmt); }
+        o
+    };
+    if (img.w, img.h) == (w, h) {
+        return img;
+    }
+    // another size: the identity transformation's resize chain (per axis halvings by pair
+    // averages stored in the node's format, then per axis 2x bilinear upsamples)
+    let wrap = mode.contains("wrap");
+    let upf = sfmt;
+    let mut cur = img;
+    let mut sample_fmt = if resampled { 3 } else { sfmt };
+    let mut halved = false;
+    while cur.w > w || cur.h > h {
+        halved = true;
+        if sample_fmt <= 1 && fmt >= 2 && !mode.contains("nohi") {
+            // UNORM file, float node: the first halving averages the 16-bit codes (ties up)
+            let (ax, ay) = (cur.w > w, cur.h > h);
+            let (nx, ny) = (1 + ax as usize, 1 + ay as usize);
+            let mut o = Image::new(cur.w / nx, cur.h / ny, cur.color, [0.0; 4]);
+            let n = (nx * ny) as u32;
+            for y in 0..o.h {
+                for x in 0..o.w {
+                    let mut sum = [0u32; 4];
+                    for dy in 0..ny { for dx in 0..nx {
+                        let p = cur.at(x * nx + dx, y * ny + dy);
+                        for c in 0..4 { sum[c] += (p[c].clamp(0.0, 1.0) * 65535.0).round() as u32; }
+                    } }
+                    o.px[y * o.w + x] = sum.map(|t| ((t + n / 2) / n) as f32 / 65535.0);
+                }
+            }
+            o.quantize(fmt);
+            cur = o;
+        } else {
+            cur = cur.downsample_axes_sampled(cur.w > w, cur.h > h, fmt, sample_fmt);
+        }
+        sample_fmt = fmt;
+    }
+    // the first upsample reads the file's own texture (UNORM codes interpolated as integers);
+    // the following ones read the float intermediates
+    let upq = !mode.contains("noq");
+    let mut first = !resampled && !halved;
+    while cur.w < w || cur.h < h {
+        cur = cur.upsample_axes_fmt(cur.w < w, cur.h < h, (wrap, wrap), if first { upf } else { 3 });
+        if upq { cur.quantize(fmt); }
+        first = false;
+    }
+    cur
 }
 
 fn from_dynamic(d: &image::DynamicImage, color: bool) -> Image {

@@ -941,15 +941,6 @@ impl<'a> Ctx<'a> {
             // parent's (lab/py/seedslot.py)
             st.seed = if (w >> 3) & 1 == 0 { k } else { st.seed.wrapping_add(k) } & M24;
             let nc = if self.color { 4 } else { 1 };
-            if crate::env_once!("SDRT_FXLOG").as_deref() == Ok("q") {
-                let mut a = at;
-                let mut d = vec![];
-                for (bit, n) in [(19, nc), (21, 2), (23, 2), (25, 2), (27, 1), (29, 1), (99, 1)] {
-                    let b = if bit == 99 { if image_flags & 2 != 0 { 2 } else { 0 } } else { (w >> bit) & 3 };
-                    d.push(match b { 1 => { let v = format!("const {:?}", (0..n).map(|k| self.p.f(a + 4 * k)).collect::<Vec<_>>()); a += 4 * n; v } 2 => { let v = format!("fn {}", self.p.w(a)); a += 4; v } _ => "-".into() });
-                }
-                eprintln!("fxquad off {} w {:08x} img {:x} seedslot {} slots {:?}", off, w, image_flags, (w >> 4) & 3, d);
-            }
             for (k, (bit, n)) in [(19, nc), (21, 2), (23, 2), (25, 2), (27, 1), (29, 1)].into_iter().enumerate() {
                 // each parameter function draws from its own LCG (SLOT_LCG)
                 let (v, next) = self.slot_with(at, w >> bit, n, &st, SLOT_LCG[k]);

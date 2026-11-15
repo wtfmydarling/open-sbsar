@@ -828,6 +828,9 @@ impl<'a, E: Env> Eval<'a, E> {
             return S::F(0.0); // 0xFFFF: no operand (e.g. the second of a sequence)
         }
         let n = comps(self.f.ins[k].ty);
+        if n > 1 && c >= n {
+            return if is_int(self.f.ins[k].ty) { S::I(0) } else { S::F(0.0) };
+        }
         let c = if n == 1 { 0 } else { c.min(3) };
         if let Some(v) = self.memo[k][c] {
             return v;

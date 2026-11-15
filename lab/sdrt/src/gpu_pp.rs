@@ -683,7 +683,12 @@ impl Compiler<'_> {
     }
     fn compute(&mut self, k: usize, c: usize) -> Result<Expr, String> {
         let Some(i) = self.f.ins.get(k).cloned() else { return Ok(lit(0.)) };
-        let c = if comps(i.ty) == 1 { 0 } else { c.min(3) };
+        let n = comps(i.ty);
+        if n > 1 && c >= n {
+            let kd = kind(i.ty);
+            return Ok(Expr { text: if kd == Kind::I { "0i" } else { "0.0" }.into(), kind: kd, konst: kconst() });
+        }
+        let c = if n == 1 { 0 } else { c.min(3) };
         if let Some(e) = self.memo.get(&(k, c)) {
             return Ok(e.clone());
         }
