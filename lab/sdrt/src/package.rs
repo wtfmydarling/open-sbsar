@@ -1,6 +1,5 @@
 //! Reading .sbsar archives: the 7z container (in process, no external tool), its graphs (one
 //! compiled program `.sbsasm` and one description `.xml` per graph) and the XML metadata.
-use std::io::Cursor;
 
 /// One graph of an archive: the compiled program and its XML description.
 pub struct RawGraph {
@@ -8,41 +7,38 @@ pub struct RawGraph {
     pub path: String,
     pub asm: Vec<u8>,
     pub xml: String,
+    /// Path of the XML description file inside the archive, if any.
+    pub xml_path: String,
 }
 
 /// Every graph of a .sbsar (a 7z archive), in archive order. Other members are ignored.
 pub fn read_archive(bytes: &[u8]) -> Result<Vec<RawGraph>, String> {
-    let mut reader = sevenz_rust2::ArchiveReader::new(Cursor::new(bytes), sevenz_rust2::Password::empty())
+    let entries = crate::sevenz::read(bytes)
         .map_err(|e| format!("not a readable .sbsar (7z) archive: {e}"))?;
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
-    reader
-        .for_each_entries(|entry, r| {
-            let name = entry.name().replace('\\', "/");
-            if !entry.is_directory() && (name.ends_with(".sbsasm") || name.ends_with(".xml")) {
-                let mut data = Vec::new();
-                r.read_to_end(&mut data)?;
-                files.push((name, data));
-            } else {
-                std::io::copy(r, &mut std::io::sink())?;
-            }
-            Ok(true)
-        })
-        .map_err(|e| format!("cannot extract the .sbsar archive: {e}"))?;
+    for entry in entries {
+        let name = entry.name.replace('\\', "/");
+        if !entry.is_directory && (name.ends_with(".sbsasm") || name.ends_with(".xml")) {
+            files.push((name, entry.data));
+        }
+    }
     let mut graphs = Vec::new();
     for (name, data) in &files {
         let Some(stem) = name.strip_suffix(".sbsasm") else { continue };
         // the description next to the program: same stem, else the only XML of the same folder
         let dir = stem.rsplit_once('/').map_or("", |(d, _)| d);
-        let xml = files
+        let xml_file = files
             .iter()
             .find(|(n, _)| n.strip_suffix(".xml") == Some(stem))
             .or_else(|| {
                 let same: Vec<_> = files.iter().filter(|(n, _)| n.ends_with(".xml") && n.rsplit_once('/').map_or("", |(d, _)| d) == dir).collect();
                 (same.len() == 1).then(|| same[0])
-            })
-            .map(|(_, x)| String::from_utf8_lossy(x).into_owned())
-            .unwrap_or_default();
-        graphs.push(RawGraph { path: name.clone(), asm: data.clone(), xml });
+            });
+        let (xml_path, xml) = match xml_file {
+            Some((p, x)) => (p.clone(), String::from_utf8_lossy(x).into_owned()),
+            None => (String::new(), String::new()),
+        };
+        graphs.push(RawGraph { path: name.clone(), asm: data.clone(), xml, xml_path });
     }
     if graphs.is_empty() {
         return Err("the archive holds no compiled graph (.sbsasm)".into());

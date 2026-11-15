@@ -31,6 +31,8 @@ pub mod ops;
 pub mod package;
 #[doc(hidden)]
 pub mod program;
+#[doc(hidden)]
+pub mod sevenz;
 mod text;
 #[doc(hidden)]
 pub mod vm;
