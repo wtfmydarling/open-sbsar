@@ -74,6 +74,42 @@ pub struct Runtime<'p> {
     /// `run_for` targets are handed here as soon as they are computed and then freed like any
     /// other image (sdrt nodes: thousands of targets would otherwise all stay in memory).
     pub sink: Option<Box<dyn FnMut(usize, &Image) + Send + Sync + 'p>>,
+    /// Incremental rendering state (`crate::api::Instance`): which node results to reuse.
+    pub incr: Option<Incr>,
+    /// Function offsets the FX-Map evaluator decoded for the node being run (incremental
+    /// rendering derives the node's graph-input reads from them).
+    pub fx_trace: std::sync::Mutex<Vec<usize>>,
+    /// Function offsets `func` returned for the node being run (incremental rendering).
+    trace: Vec<usize>,
+}
+
+/// What a node read when it was last computed: the graph inputs (uids) and the value-processor
+/// slots with the values they had.
+#[derive(Clone, Debug, Default)]
+pub struct NodeReads {
+    pub uids: Vec<u32>,
+    pub slots: Vec<(u16, Value)>,
+    pub size: (u32, u32),
+    pub unsupported: Vec<String>,
+}
+
+/// Cache of node results kept between renders of one graph. A node is reused when its result
+/// is kept, none of the graph inputs it read changed, none of its input nodes was recomputed and
+/// the value-processor slots it read hold the same values; anything else is recomputed.
+#[derive(Default)]
+pub struct Incr {
+    /// graph inputs (uids) whose value differs from the previous render
+    pub changed: std::collections::HashSet<u32>,
+    /// per node: its result is kept (in `images` and/or resident on the GPU)
+    pub cached: Vec<bool>,
+    pub reads: Vec<NodeReads>,
+    pub bytes: Vec<usize>,
+    pub budget: usize,
+    pub used: usize,
+    /// per function offset: the input uids and value-processor slots it reads
+    func_reads: HashMap<usize, (Vec<u32>, Vec<u16>)>,
+    pub recomputed: usize,
+    pub reused: usize,
 }
 
 /// Environment of a node's parameter functions (evaluated once per node).
@@ -253,7 +289,19 @@ impl<'p> Runtime<'p> {
             sizes: p.nodes.iter().map(|n| n.log2).collect(),
             node_vars: Vec::new(),
             sink: None,
+            incr: None,
+            fx_trace: std::sync::Mutex::new(Vec::new()),
+            trace: Vec::new(),
         }
+    }
+
+    /// Take the GPU context back with its resident images (incremental rendering keeps them).
+    #[cfg(feature = "gpu")]
+    pub fn take_gpu(&mut self) -> Option<crate::gpu::Gpu> {
+        if let Some(g) = &mut self.gpu {
+            g.flush();
+        }
+        self.gpu.take()
     }
 
     /// Use an existing GPU context (its pipelines stay cached across runtimes).
@@ -281,6 +329,9 @@ impl<'p> Runtime<'p> {
     }
 
     pub fn func(&mut self, off: usize) -> Func {
+        if self.incr.is_some() {
+            self.trace.push(off);
+        }
         self.funcs.entry(off).or_insert_with(|| Func::decode(self.p, off)).clone()
     }
 
@@ -373,12 +424,31 @@ impl<'p> Runtime<'p> {
 
     fn run_inner(&mut self, keep_all: bool, targets: Option<&[usize]>) {
         #[cfg(feature="gpu")]
-        if let Some(gpu)=&mut self.gpu { gpu.reset(); }
+        if let Some(gpu)=&mut self.gpu { if self.incr.is_some() { gpu.flush(); } else { gpu.reset(); } }
         let n = self.p.nodes.len();
         let outs: Vec<usize> = match targets {
             Some(t) => t.to_vec(),
             None => self.p.outputs.iter().map(|o| o.node).collect(),
         };
+        let node_srcs = |node: &Node| -> Vec<usize> {
+            node.inputs.iter().copied().chain(node.params.iter().filter_map(|(_, s)| if let Slot::Input(k) = s { Some(*k) } else { None })).collect()
+        };
+        let is_vp = |nd: &Node| nd.op == 0x28 && nd.flags >> 16 != 0;
+        // incremental: nodes that may need recomputing (not kept, a changed input read, an input
+        // node that may be recomputed, or value-processor slots read). The inputs of the others
+        // are not needed: their kept results are reused.
+        let maybe_dirty: Option<Vec<bool>> = self.incr.as_mut().map(|inc| {
+            inc.cached.resize(n, false);
+            inc.reads.resize(n, NodeReads::default());
+            inc.bytes.resize(n, 0);
+            let mut md = vec![false; n];
+            for (k, nd) in self.p.nodes.iter().enumerate() {
+                let r = &inc.reads[k];
+                md[k] = !inc.cached[k] || is_vp(nd) || !r.slots.is_empty() || r.uids.iter().any(|u| inc.changed.contains(u))
+                    || node_srcs(nd).iter().any(|&j| j >= k || md[j]);
+            }
+            md
+        });
         // only nodes the outputs depend on (sbsrender skips the rest too)
         let mut needed = vec![keep_all; n];
         let mut stack: Vec<usize> = outs.clone();
@@ -390,6 +460,9 @@ impl<'p> Runtime<'p> {
                 continue;
             }
             needed[k] = true;
+            if maybe_dirty.as_ref().is_some_and(|md| !md[k]) {
+                continue;
+            }
             let node = &self.p.nodes[k];
             stack.extend(node.inputs.iter().copied().filter(|&j| j < n && !needed[j]));
             for (_, s) in &node.params {
@@ -415,10 +488,39 @@ impl<'p> Runtime<'p> {
                 if i<n {last_use[i]=node.index;}
             }
         }
+        let mut recomputed = vec![false; n];
         for i in 0..n {
             if !needed[i] {
                 continue;
             }
+            if let Some(inc) = &mut self.incr {
+                let nd = &self.p.nodes[i];
+                let r = &inc.reads[i];
+                let reuse = inc.cached[i]
+                    && !is_vp(nd)
+                    && !r.uids.iter().any(|u| inc.changed.contains(u))
+                    && !node_srcs(nd).iter().any(|&j| j >= i || recomputed[j])
+                    && r.slots.iter().all(|(s, v)| self.vp_slots.get(s).copied().unwrap_or(Value::f1(0.0)) == *v);
+                if reuse {
+                    inc.reused += 1;
+                    self.sizes[i] = r.size;
+                    for u in r.unsupported.clone() { self.unsupported.push((i, u)); }
+                    #[cfg(feature="gpu")]
+                    if is_out[i] { self.materialize(i); }
+                    continue;
+                }
+                inc.recomputed += 1;
+                recomputed[i] = true;
+                // drop the stale result
+                inc.used -= std::mem::take(&mut inc.bytes[i]);
+                inc.cached[i] = false;
+                self.images[i] = None;
+                #[cfg(feature="gpu")]
+                if let Some(g)=&mut self.gpu { g.release(i); }
+                self.trace.clear();
+                self.fx_trace.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+            let unsupported_before = self.unsupported.len();
             let node = self.p.nodes[i].clone();
             // an unconnected pixel-processor input (0xFFFFFFFF, v9: kachelboden 364/382) samples as
             // transparent black; any other input at or after the node is unsupported
@@ -472,6 +574,9 @@ impl<'p> Runtime<'p> {
                 eprintln!("slow: node {} op {:#04x} {}x{} {:.2}s inputs {:?}", i, node.op, node.size().0, node.size().1, dt, ins);
             }
             let streamed = self.sink.is_some() && is_out[i];
+            if self.incr.is_some() {
+                self.record_incr(&node, unsupported_before);
+            }
             if streamed {
                 (self.sink.as_mut().unwrap())(i, self.images[i].as_ref().expect("export materialized"));
             }
@@ -482,7 +587,7 @@ impl<'p> Runtime<'p> {
             }
             if !keep_all {
                 for k in node.inputs.iter().copied().chain(node.params.iter().filter_map(|(_,s)|if let Slot::Input(k)=s {Some(*k)} else {None})) {
-                    if k < n && last_use[k] == i && (!is_out[k] || self.sink.is_some()) {
+                    if k < n && last_use[k] == i && (!is_out[k] || self.sink.is_some()) && !self.incr.as_ref().is_some_and(|c| c.cached[k]) {
                         self.images[k] = None;
                         #[cfg(feature="gpu")]
                         if let Some(g)=&mut self.gpu { g.release(k); }
@@ -495,6 +600,64 @@ impl<'p> Runtime<'p> {
         if let Some(gpu) = &mut self.gpu {
             gpu.flush();
         }
+    }
+
+    /// Incremental rendering: note what node `node` read (the functions it evaluated, its bitmap
+    /// or text input) and keep its result while the cache budget allows.
+    fn record_incr(&mut self, node: &Node, unsupported_before: usize) {
+        let i = node.index;
+        let mut offs = std::mem::take(&mut self.trace);
+        offs.append(&mut self.fx_trace.lock().unwrap_or_else(|e| e.into_inner()));
+        offs.sort_unstable();
+        offs.dedup();
+        let (mut uids, mut slots) = (vec![], vec![]);
+        for off in offs {
+            let p = self.p;
+            let funcs = &self.funcs;
+            let inc = self.incr.as_mut().unwrap();
+            let (u, s) = inc.func_reads.entry(off).or_insert_with(|| match funcs.get(&off) { Some(f) => f.graph_reads(), None => Func::decode(p, off).graph_reads() });
+            uids.extend_from_slice(u);
+            slots.extend_from_slice(s);
+        }
+        // graph-input bitmaps (op 0x20 with b3 0) and text from a string input read their uid directly
+        if (node.op == 0x20 && node.b3 == 0) || (node.op == 0x22 && node.flags & 3 == 2) {
+            uids.push(node.data as u32);
+        }
+        uids.sort_unstable();
+        uids.dedup();
+        slots.sort_unstable();
+        slots.dedup();
+        let slots: Vec<(u16, Value)> = slots.into_iter().map(|s| (s, self.vp_slot(s as usize))).collect();
+        let unsupported = self.unsupported[unsupported_before..].iter().map(|(_, w)| w.clone()).collect();
+        #[cfg(feature = "gpu")]
+        let dims = self.gpu.as_ref().and_then(|g| g.size(i)).or_else(|| self.images[i].as_ref().map(|m| (m.w, m.h)));
+        #[cfg(not(feature = "gpu"))]
+        let dims = self.images[i].as_ref().map(|m| (m.w, m.h));
+        let size = self.sizes[i];
+        let inc = self.incr.as_mut().unwrap();
+        inc.reads[i] = NodeReads { uids, slots, size, unsupported };
+        if let Some((w, h)) = dims {
+            let bytes = w * h * 16;
+            if inc.used + bytes <= inc.budget {
+                inc.used += bytes;
+                inc.bytes[i] = bytes;
+                inc.cached[i] = true;
+            }
+        }
+    }
+
+    /// Incremental rendering, after the outputs were read: free every result that is not kept.
+    pub fn incr_finish(&mut self) {
+        let Some(inc) = &self.incr else { return };
+        for k in 0..self.images.len() {
+            if !inc.cached.get(k).copied().unwrap_or(false) {
+                self.images[k] = None;
+                #[cfg(feature = "gpu")]
+                if let Some(g) = &mut self.gpu { g.release(k); }
+            }
+        }
+        #[cfg(feature = "gpu")]
+        if let Some(g) = &mut self.gpu { g.flush(); }
     }
 
     /// The transformation node (op 0x04) on the GPU, as a chain of gpu_xf.wgsl passes that

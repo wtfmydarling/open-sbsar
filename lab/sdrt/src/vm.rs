@@ -116,6 +116,7 @@ impl std::fmt::Debug for Ops {
 
 #[derive(Clone, Debug)]
 pub struct Func {
+    /// the instructions; `reads()` lists the graph inputs among them
     pub ins: Vec<Ins>,
     side: Vec<bool>,
     /// Per register component: live with two or more consumers. Such a component is also
@@ -227,6 +228,19 @@ fn reg_operands(i: &Ins) -> &[u16] {
 }
 
 impl Func {
+    /// The graph inputs (uids, op 2) and value-processor slots (op 3) this function reads.
+    pub fn graph_reads(&self) -> (Vec<u32>, Vec<u16>) {
+        let mut uids = vec![];
+        let mut slots = vec![];
+        for (k, i) in self.ins.iter().enumerate() {
+            match i.op {
+                2 => uids.push(self.lits[k][0]),
+                3 => slots.push(i.ops.first().copied().unwrap_or(0)),
+                _ => {}
+            }
+        }
+        (uids, slots)
+    }
     pub fn decode(p: &Program, off: usize) -> Func {
         let b = &p.b;
         let mut o = p.base + off;

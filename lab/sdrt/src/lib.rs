@@ -5,7 +5,7 @@
 //! [`Parameters`] and [`Renderer`]; the format itself is specified in the repository's `docs/`.
 
 mod api;
-pub use api::{Error, Graph, InputImage, OutputImage, Package, Parameters, PixelFormat, Renderer, Result, Value};
+pub use api::{Error, Graph, InputImage, Instance, OutputImage, Package, Parameters, PixelFormat, RenderStats, Renderer, Result, Value};
 pub use package::{InputInfo, InputKind, OutputInfo};
 /// The wgpu version this crate uses (for [`Renderer::with_device`]).
 #[cfg(feature = "gpu")]

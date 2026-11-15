@@ -27,8 +27,7 @@ Version 0.1: usable, under active development.
 - **Image inputs** (curvature, ambient occlusion, position, normal maps…) are evaluated: pass
   images with `Parameters::set_image` (CLI: `--set-image IDENT=path`).
 - **Pure Rust**: the `.sbsar` archive is read by the crate's own 7z reader; no external tools.
-- **Not yet**: incremental re-rendering of only the nodes a parameter change affects,
-  WebAssembly/WebGPU.
+- **Not yet**: WebAssembly/WebGPU.
 
 ## Library
 
@@ -66,12 +65,18 @@ for out in renderer.render(graph, &params, None)? {         // None: every image
   `data` holds `width * height * channels` f32 values in 0..1 (1 or 4 channels) and `storage`
   is the source format (`U8`/`U16`/`F16`/`F32`). An image input that is not set uses the
   graph's default (or transparent black).
+- **Incremental re-rendering**: an `Instance` re-renders a graph after parameter changes,
+  recomputing only the nodes whose result can change; its outputs are byte-identical to a full
+  render. `instance.render(&mut renderer, graph, &params, None)`, then
+  `instance.last_stats()` gives the nodes recomputed and reused. Results are kept within a
+  memory budget (`set_cache_budget`, default 1 GiB).
 - **Reuse one renderer**: it keeps the GPU context and the compiled shaders between renders; the
   first render of a material compiles its shaders, later ones do not.
 - Errors (also internal failures) are returned as `open_sbsar::Error`; `renderer.warnings` lists
   ignored inputs and unsupported features of the last render.
 - Examples: `lab/sdrt/examples/render.rs` (all outputs to 16-bit PNGs),
-  `lab/sdrt/examples/host_device.rs` (rendering on a host device).
+  `lab/sdrt/examples/host_device.rs` (rendering on a host device),
+  `lab/sdrt/examples/incremental_check.rs` (incremental renders checked against full ones).
 
 ## Command-line tool
 

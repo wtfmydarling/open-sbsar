@@ -37,6 +37,9 @@ pub struct Pass {
 pub const XF: (&str, &str) = ("transformation", include_str!("gpu_xf.wgsl"));
 pub const ATOMIC: (&str, &str) = ("atomic", concat!(include_str!("gpu_sample.wgsl"), include_str!("gpu_atomic.wgsl")));
 
+/// Upper bound of the bytes of released image buffers kept for reuse.
+const POOL_BYTES: u64 = 1 << 30;
+
 pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -56,7 +59,8 @@ pub struct Gpu {
     pool: HashMap<u64, Vec<Arc<wgpu::Buffer>>>,
     pending_buffers: Vec<Arc<wgpu::Buffer>>,
     read_pool: HashMap<u64, Vec<wgpu::Buffer>>,
-    params_pool: Vec<wgpu::Buffer>,
+    /// bytes of the buffers in `pool` (bounded by POOL_BYTES)
+    pooled: u64,
     params_pending: Vec<wgpu::Buffer>,
 }
 impl Gpu {
@@ -172,7 +176,7 @@ impl Gpu {
             pool: HashMap::new(),
             pending_buffers: Vec::new(),
             read_pool: HashMap::new(),
-            params_pool: Vec::new(),
+            pooled: 0,
             params_pending: Vec::new(),
         })
     }
@@ -193,15 +197,21 @@ impl Gpu {
     }
 
     fn reclaim(&mut self) {
-        for buf in self.pending_buffers.drain(..) {
-            self.pool.entry(buf.size()).or_default().push(buf);
+        // released image buffers are kept for reuse up to POOL_BYTES, the rest are freed (wgpu
+        // frees a dropped buffer once the submitted work using it is done)
+        for buf in std::mem::take(&mut self.pending_buffers) {
+            if self.pooled + buf.size() <= POOL_BYTES {
+                self.pooled += buf.size();
+                self.pool.entry(buf.size()).or_default().push(buf);
+            }
         }
-        self.params_pool.append(&mut self.params_pending);
+        self.params_pending.clear();
     }
 
     fn get_buffer(&mut self, size: u64, label: &'static str) -> Arc<wgpu::Buffer> {
         if let Some(list) = self.pool.get_mut(&size) {
             while let Some(buf) = list.pop() {
+                self.pooled -= size;
                 if Arc::strong_count(&buf) == 1 {
                     return buf;
                 }
@@ -221,6 +231,14 @@ impl Gpu {
             contents: bytemuck::cast_slice(words),
             usage: wgpu::BufferUsages::STORAGE,
         }), false)
+    }
+
+    /// Free every pooled buffer (GPU memory is given back to the device).
+    pub fn trim(&mut self) {
+        self.flush();
+        self.pool.clear();
+        self.read_pool.clear();
+        self.pooled = 0;
     }
 
     fn get_read_buffer(&mut self, bytes: u64) -> wgpu::Buffer {

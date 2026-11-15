@@ -49,6 +49,19 @@ name = "gpu_exact_probe"
 path = "src/bin/gpu_exact_probe.rs"
 required-features = ["research"]
 
+# the examples use the GPU path (Renderer::new_gpu / with_device)
+[[example]]
+name = "render"
+required-features = ["gpu"]
+
+[[example]]
+name = "host_device"
+required-features = ["gpu"]
+
+[[example]]
+name = "incremental_check"
+required-features = ["gpu"]
+
 [dependencies.wgpu]
 version = "30"
 optional = true

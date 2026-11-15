@@ -74,6 +74,8 @@ pub struct Graph {
     label: Option<String>,
     inputs: Vec<InputInfo>,
     outputs: Vec<OutputInfo>,
+    /// unique per graph object (an [`Instance`] belongs to one graph)
+    uid: u64,
 }
 
 impl Graph {
@@ -89,7 +91,9 @@ impl Graph {
             }
         }
         outputs.retain(|x| program.outputs.iter().any(|o| o.uid == x.uid));
-        Ok(Graph { path, program, xml, label, inputs, outputs })
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let uid = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Graph { path, program, xml, label, inputs, outputs, uid })
     }
     /// Path of the program inside the archive.
     pub fn path(&self) -> &str {
@@ -287,6 +291,15 @@ pub struct Renderer {
     gpu: Option<crate::gpu::Gpu>,
     /// Warnings of the last render (unsupported features, ignored inputs).
     pub warnings: Vec<String>,
+    /// identity and render count: an [`Instance`] reuses GPU results only on the renderer, and
+    /// the render, that produced them
+    id: u64,
+    epoch: u64,
+}
+
+fn next_renderer_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Renderer {
@@ -296,12 +309,14 @@ impl Renderer {
             #[cfg(feature = "gpu")]
             gpu: None,
             warnings: vec![],
+            id: next_renderer_id(),
+            epoch: 0,
         }
     }
     /// The GPU path on a hardware Vulkan adapter (feature `gpu`).
     #[cfg(feature = "gpu")]
     pub fn new_gpu() -> Result<Renderer> {
-        Ok(Renderer { gpu: Some(crate::gpu::Gpu::new()?), warnings: vec![] })
+        Ok(Renderer { gpu: Some(crate::gpu::Gpu::new()?), warnings: vec![], id: next_renderer_id(), epoch: 0 })
     }
     /// The GPU path on a device the host application already uses (its `wgpu::Device` and
     /// `wgpu::Queue`, wgpu 30: see [`crate::wgpu`]). Nothing is requested from the device; an
@@ -310,7 +325,7 @@ impl Renderer {
     /// differently in the last bits.
     #[cfg(feature = "gpu")]
     pub fn with_device(device: wgpu::Device, queue: wgpu::Queue) -> Result<Renderer> {
-        Ok(Renderer { gpu: Some(crate::gpu::Gpu::from_device(device, queue)?), warnings: vec![] })
+        Ok(Renderer { gpu: Some(crate::gpu::Gpu::from_device(device, queue)?), warnings: vec![], id: next_renderer_id(), epoch: 0 })
     }
     /// Whether this renderer uses the GPU.
     pub fn is_gpu(&self) -> bool {
@@ -322,6 +337,11 @@ impl Renderer {
 
     /// Render `outputs` (identifiers; `None`: every image output) of a graph.
     pub fn render(&mut self, graph: &Graph, params: &Parameters, outputs: Option<&[&str]>) -> Result<Vec<OutputImage>> {
+        self.render_impl(graph, params, outputs, None)
+    }
+
+    fn render_impl(&mut self, graph: &Graph, params: &Parameters, outputs: Option<&[&str]>, mut inst: Option<&mut Instance>) -> Result<Vec<OutputImage>> {
+        self.epoch += 1;
         let wanted: Vec<&OutputInfo> = match outputs {
             None => graph.outputs.iter().filter(|o| o.is_image).collect(),
             Some(ids) => ids
@@ -379,6 +399,9 @@ impl Renderer {
             let fmt = match im.storage { PixelFormat::U8 => 0, PixelFormat::U16 => 1, PixelFormat::F16 | PixelFormat::F32 => 3 };
             rt.set_image(uid, img, fmt);
         }
+        if let Some(inst) = inst.as_deref_mut() {
+            inst.begin(&mut rt, self.id, self.epoch - 1);
+        }
         let nodes: Vec<(usize, &OutputInfo)> = wanted
             .iter()
             .filter_map(|o| graph.program.outputs.iter().find(|p| p.uid == o.uid).map(|p| (p.node, *o)))
@@ -393,6 +416,7 @@ impl Renderer {
                 let format = PixelFormat::from_storage(graph.program.nodes[*k].format());
                 out.push(OutputImage::new(o.identifier.clone(), o.uid, img, format));
             }
+            rt.incr_finish();
             Ok::<_, Error>(out)
         }));
         for (_, why) in &rt.unsupported {
@@ -400,9 +424,13 @@ impl Renderer {
                 warnings.push(format!("unsupported: {why}"));
             }
         }
+        let ok = matches!(run, Ok(Ok(_)));
         #[cfg(feature = "gpu")]
         {
-            self.gpu = rt.detach_gpu();
+            self.gpu = if inst.is_some() && ok { rt.take_gpu() } else { rt.detach_gpu() };
+        }
+        if let Some(inst) = inst {
+            inst.end(&mut rt, ok, self.id, self.epoch);
         }
         self.warnings = warnings;
         match run {
@@ -416,6 +444,150 @@ impl Renderer {
                 }
                 Err(Error(format!("render failed: {msg}")))
             }
+        }
+    }
+}
+
+/// Counts of the last [`Instance::render`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    /// nodes computed in the last render
+    pub recomputed: usize,
+    /// nodes whose kept result was reused
+    pub reused: usize,
+}
+
+/// A graph being edited: renders it again after parameter changes, recomputing only the nodes
+/// whose result can change and reusing the kept results of the others. The outputs are
+/// identical to [`Renderer::render`] with the same parameters.
+///
+/// A node is reused when none of the graph inputs its functions read changed, none of its
+/// input nodes was recomputed, and the value-processor values it read are the same. Results
+/// are kept within a memory budget (default 1 GiB; [`Instance::set_cache_budget`]); what does
+/// not fit is recomputed when needed. Use one instance with one renderer: rendering with
+/// another renderer, or rendering anything else on the same renderer in between, makes the
+/// next render a full one. GPU results stay on the renderer's device.
+///
+/// ```no_run
+/// use open_sbsar::{Instance, Package, Parameters, Renderer, Value};
+/// let package = Package::open("material.sbsar")?;
+/// let graph = &package.graphs()[0];
+/// let mut renderer = Renderer::new_gpu()?;
+/// let mut instance = Instance::new(graph);
+/// let mut params = Parameters::new();
+/// params.set("$outputsize", Value::Int(vec![9, 9]));
+/// let first = instance.render(&mut renderer, graph, &params, None)?;   // full render
+/// params.set("$randomseed", Value::Int(vec![3]));
+/// let again = instance.render(&mut renderer, graph, &params, None)?;   // only what changed
+/// println!("{:?}", instance.last_stats());
+/// # Ok::<(), open_sbsar::Error>(())
+/// ```
+pub struct Instance {
+    graph: u64,
+    /// (renderer id, its render count after our last render): the kept results are valid
+    renderer: Option<(u64, u64)>,
+    images: Vec<Option<std::sync::Arc<Image>>>,
+    incr: Option<crate::ops::Incr>,
+    inputs: HashMap<u32, crate::vm::Value>,
+    strings: HashMap<u32, String>,
+    image_inputs: HashMap<u32, (std::sync::Arc<Image>, u32)>,
+    budget: usize,
+    stats: RenderStats,
+}
+
+impl Instance {
+    /// An instance of `graph` with an empty cache.
+    pub fn new(graph: &Graph) -> Instance {
+        Instance {
+            graph: graph.uid,
+            renderer: None,
+            images: vec![],
+            incr: None,
+            inputs: HashMap::new(),
+            strings: HashMap::new(),
+            image_inputs: HashMap::new(),
+            budget: 1 << 30,
+            stats: RenderStats::default(),
+        }
+    }
+    /// Render `outputs` (`None`: every image output) of `graph` (the graph this instance was
+    /// created for) with `params`, reusing what the previous render computed.
+    pub fn render(&mut self, renderer: &mut Renderer, graph: &Graph, params: &Parameters, outputs: Option<&[&str]>) -> Result<Vec<OutputImage>> {
+        if graph.uid != self.graph {
+            return Err(Error("Instance::render: another graph than the instance's".into()));
+        }
+        renderer.render_impl(graph, params, outputs, Some(self))
+    }
+    /// Nodes recomputed and reused by the last render.
+    pub fn last_stats(&self) -> RenderStats {
+        self.stats
+    }
+    /// Drop the kept results: the next render is a full one.
+    pub fn clear(&mut self) {
+        self.renderer = None;
+        self.images.clear();
+        self.incr = None;
+    }
+    /// Memory for kept results, in bytes (16 per pixel). Lowering it clears the cache.
+    pub fn set_cache_budget(&mut self, bytes: usize) {
+        if bytes < self.budget {
+            self.clear();
+        }
+        self.budget = bytes;
+    }
+
+    fn begin(&mut self, rt: &mut crate::ops::Runtime, renderer: u64, epoch: u64) {
+        let n = rt.p.nodes.len();
+        let valid = self.renderer == Some((renderer, epoch)) && self.images.len() == n && self.incr.is_some();
+        let mut incr = if valid { self.incr.take().unwrap() } else { crate::ops::Incr::default() };
+        incr.budget = self.budget;
+        incr.recomputed = 0;
+        incr.reused = 0;
+        incr.changed.clear();
+        if valid {
+            let mut changed = std::collections::HashSet::new();
+            for (u, v) in rt.inputs.iter() {
+                if self.inputs.get(u) != Some(v) { changed.insert(*u); }
+            }
+            for u in self.inputs.keys() {
+                if !rt.inputs.contains_key(u) { changed.insert(*u); }
+            }
+            for (u, v) in rt.strings.iter() {
+                if self.strings.get(u) != Some(v) { changed.insert(*u); }
+            }
+            for u in self.strings.keys() {
+                if !rt.strings.contains_key(u) { changed.insert(*u); }
+            }
+            let same = |a: &(std::sync::Arc<Image>, u32), b: &(std::sync::Arc<Image>, u32)| {
+                a.1 == b.1 && a.0.w == b.0.w && a.0.h == b.0.h && a.0.color == b.0.color
+                    && a.0.px.iter().zip(&b.0.px).all(|(p, q)| p.iter().zip(q).all(|(x, y)| x.to_bits() == y.to_bits()))
+            };
+            for (u, v) in rt.image_inputs.iter() {
+                if !self.image_inputs.get(u).is_some_and(|w| same(v, w)) { changed.insert(*u); }
+            }
+            for u in self.image_inputs.keys() {
+                if !rt.image_inputs.contains_key(u) { changed.insert(*u); }
+            }
+            incr.changed = changed;
+            rt.images = std::mem::take(&mut self.images);
+        } else {
+            self.images.clear();
+        }
+        self.inputs = rt.inputs.clone();
+        self.strings = rt.strings.clone();
+        self.image_inputs = rt.image_inputs.clone();
+        rt.incr = Some(incr);
+    }
+
+    fn end(&mut self, rt: &mut crate::ops::Runtime, ok: bool, renderer: u64, epoch: u64) {
+        let incr = rt.incr.take();
+        self.stats = incr.as_ref().map_or_else(RenderStats::default, |c| RenderStats { recomputed: c.recomputed, reused: c.reused });
+        if ok {
+            self.images = std::mem::take(&mut rt.images);
+            self.incr = incr;
+            self.renderer = Some((renderer, epoch));
+        } else {
+            self.clear();
         }
     }
 }

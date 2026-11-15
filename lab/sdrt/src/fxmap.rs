@@ -585,7 +585,12 @@ impl<'a> Ctx<'a> {
 
     fn eval_mode(&self, off: usize, st: &State, lcg: (u32, u32), full_rand: bool) -> Value {
         let t0 = if prof() { Some(std::time::Instant::now()) } else { None };
-        let f = self.funcs.borrow_mut().entry(off).or_insert_with(|| std::sync::Arc::new(Func::decode(self.p, off))).clone();
+        let f = self.funcs.borrow_mut().entry(off).or_insert_with(|| {
+            if self.rt.incr.is_some() {
+                self.rt.fx_trace.lock().unwrap_or_else(|e| e.into_inner()).push(off);
+            }
+            std::sync::Arc::new(Func::decode(self.p, off))
+        }).clone();
         let mut env = QuadEnv { rt: self.rt, inputs: &self.inputs, input_formats: &self.input_formats, state: st.seed & M24, number: st.number, depth: st.depth as f32, pos: st.center, lcg, full_rand, filter: 0, track: self.track.as_ref() };
         let v = Eval::run_with_vars_in(&f, &mut env, &mut self.vars.borrow_mut(), &mut self.bufs.borrow_mut());
         if let Some(t0) = t0 {
