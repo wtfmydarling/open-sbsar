@@ -71,6 +71,24 @@ fn hw_len(a: f32, b: f32) -> f32 {
     hi * (p0 + (p1 - p0) * (r - x0) / (x1 - x0))
 }
 
+/// Exact half-turn matrices avoid moving nearest-filtered image coordinates across texel ties.
+/// In multiwood 89, sin(-PI) in f32 selected a bright neighbouring row for half-turned stamps.
+/// Both CPU sampling and the GPU's uploaded draw constants use this function. Coverage and
+/// mip selection retain their independently measured rules.
+fn sample_rotation(rot: f32, nearest_image: bool) -> (f32, f32) {
+    // Do not generalize this to other cardinal angles or equivalent turns: the 14.1 Vulkan
+    // interpolation ties at 0, quarter turns and 1.5 turns do not obey the same rule.
+    if nearest_image && rot.abs() == 0.5 && crate::env_once!("SDRT_FXROT_LEGACY").is_err() {
+        return (-1.0, 0.0);
+    }
+    let a = -rot * std::f32::consts::TAU;
+    if crate::env_once!("SDRT_SBSROT").is_ok() {
+        (crate::vm::sbs_cos(a), crate::vm::sbs_sin(a))
+    } else {
+        (a.cos(), a.sin())
+    }
+}
+
 /// What a parameter function of a tree node sees.
 struct QuadEnv<'a> {
     rt: &'a Runtime<'a>,
@@ -1091,9 +1109,7 @@ impl<'a> Ctx<'a> {
             }
         }
         let a = -rot * std::f32::consts::TAU;
-        // the rasterizer's rotation is not the CPU sine (terrazzosubstance001 node 921: libm is closer;
-        // exact edges need the GPU's own rasterization rules); SDRT_SBSROT=1 tries the CPU sine
-        let (ca, sa) = if crate::env_once!("SDRT_SBSROT").is_ok() { (crate::vm::sbs_cos(a), crate::vm::sbs_sin(a)) } else { (a.cos(), a.sin()) };
+        let (ca, sa) = sample_rotation(rot, src == 2 && (image_flags >> 2) & 3 == 2);
         // coverage is decided in double precision: a 45° square whose edges pass through pixel centres
         // in f32 matches sbsrender only so (scratch/rast/emu.py: f64 geometry, 0 of 25 cases differ)
         let cov = Cover::new(rot, sz);
@@ -1865,6 +1881,7 @@ fn gpu_plan_chunk(ctx: &Ctx, draws: &[DrawRec]) -> Result<Image, String> {
             image_desc=[offset,img.w as u32,img.h as u32,ctx.input_formats[index]|((img.color as u32)<<4)|(filter<<8)];
         }
         let cov=Cover::new(rot,sz);
+        let (sample_ca,sample_sa)=sample_rotation(rot,src==2 && (image_flags>>2)&3==2);
         let ext=sz[0].abs().max(sz[1].abs())*0.7072;
         let mut append=|bounds:[usize;4],center:[f32;2],ox:i64,oy:i64| -> Result<(),String> {
             let [l,r,t,b]=bounds;
@@ -1872,7 +1889,7 @@ fn gpu_plan_chunk(ctx: &Ctx, draws: &[DrawRec]) -> Result<Image, String> {
             table.extend([words([l as u32,r as u32,t as u32,b as u32]),
                 [center[0],center[1],sz[0]/2.0,sz[1]/2.0],words([ox as u32,oy as u32,if src==2 {16} else {kind},u32::from(bm)]),
                 [op[0],op.get(1).copied().unwrap_or(0.0),op.get(2).copied().unwrap_or(0.0),op.get(3).copied().unwrap_or(1.0)],
-                [weight,suppl,(-rot*std::f32::consts::TAU).sin(),(-rot*std::f32::consts::TAU).cos()],
+                [weight,suppl,sample_sa,sample_ca],
                 words([0,0,0,0]),words(image_desc)]);
             if rot != 0.0 {
                 // WGSL has no f64. Keep the exact CPU coverage predicates on the host,
