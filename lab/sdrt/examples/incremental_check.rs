@@ -77,6 +77,10 @@ fn main() {
         let graph = &package.graphs()[0];
         let (mut inc_r, mut full_r) = (renderer(gpu), renderer(gpu));
         let mut inst = Instance::new(graph);
+        // INCR_BUDGET_MB: a small cache budget exercises eviction
+        if let Some(mb) = std::env::var("INCR_BUDGET_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+            inst.set_cache_budget(mb << 20);
+        }
         let mut params = Parameters::new();
         params.set("$outputsize", Value::Int(vec![size, size]));
         if let Err(e) = inst.render(&mut inc_r, graph, &params, None) {

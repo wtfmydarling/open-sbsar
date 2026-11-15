@@ -104,6 +104,8 @@ pub struct Incr {
     pub cached: Vec<bool>,
     pub reads: Vec<NodeReads>,
     pub bytes: Vec<usize>,
+    /// seconds the node took when last computed (with `bytes`: what keeping it saves)
+    pub cost: Vec<f64>,
     pub budget: usize,
     pub used: usize,
     /// per function offset: the input uids and value-processor slots it reads
@@ -441,6 +443,7 @@ impl<'p> Runtime<'p> {
             inc.cached.resize(n, false);
             inc.reads.resize(n, NodeReads::default());
             inc.bytes.resize(n, 0);
+            inc.cost.resize(n, 0.0);
             let mut md = vec![false; n];
             for (k, nd) in self.p.nodes.iter().enumerate() {
                 let r = &inc.reads[k];
@@ -575,7 +578,7 @@ impl<'p> Runtime<'p> {
             }
             let streamed = self.sink.is_some() && is_out[i];
             if self.incr.is_some() {
-                self.record_incr(&node, unsupported_before);
+                self.record_incr(&node, unsupported_before, dt, &last_use, &is_out);
             }
             if streamed {
                 (self.sink.as_mut().unwrap())(i, self.images[i].as_ref().expect("export materialized"));
@@ -604,7 +607,7 @@ impl<'p> Runtime<'p> {
 
     /// Incremental rendering: note what node `node` read (the functions it evaluated, its bitmap
     /// or text input) and keep its result while the cache budget allows.
-    fn record_incr(&mut self, node: &Node, unsupported_before: usize) {
+    fn record_incr(&mut self, node: &Node, unsupported_before: usize, dt: f64, last_use: &[usize], is_out: &[bool]) {
         let i = node.index;
         let mut offs = std::mem::take(&mut self.trace);
         offs.append(&mut self.fx_trace.lock().unwrap_or_else(|e| e.into_inner()));
@@ -636,12 +639,49 @@ impl<'p> Runtime<'p> {
         let size = self.sizes[i];
         let inc = self.incr.as_mut().unwrap();
         inc.reads[i] = NodeReads { uids, slots, size, unsupported };
-        if let Some((w, h)) = dims {
-            let bytes = w * h * 16;
-            if inc.used + bytes <= inc.budget {
-                inc.used += bytes;
-                inc.bytes[i] = bytes;
-                inc.cached[i] = true;
+        inc.cost[i] = dt;
+        let Some((w, h)) = dims else { return };
+        let bytes = w * h * 16;
+        if bytes > inc.budget {
+            return;
+        }
+        // over budget: evict kept results that save less time per byte than this one
+        let worth = |c: f64, b: usize| c / b.max(1) as f64;
+        let mine = worth(dt, bytes);
+        let mut evict = vec![];
+        while inc.used + bytes > inc.budget {
+            let victim = (0..inc.cached.len())
+                .filter(|&k| inc.cached[k] && k != i && !evict.contains(&k))
+                .min_by(|&a, &b| worth(inc.cost[a], inc.bytes[a]).total_cmp(&worth(inc.cost[b], inc.bytes[b])));
+            match victim {
+                Some(k) if worth(inc.cost[k], inc.bytes[k]) < mine => {
+                    inc.used -= inc.bytes[k];
+                    evict.push(k);
+                }
+                _ => break,
+            }
+        }
+        if inc.used + bytes > inc.budget {
+            // not kept: give the evictions back
+            for k in evict {
+                inc.used += inc.bytes[k];
+            }
+            return;
+        }
+        for &k in &evict {
+            inc.cached[k] = false;
+            inc.bytes[k] = 0;
+        }
+        inc.used += bytes;
+        inc.bytes[i] = bytes;
+        inc.cached[i] = true;
+        // free evicted results this render no longer reads (the others are freed after their
+        // last use; outputs at the end)
+        for k in evict {
+            if !is_out[k] && (last_use[k] < i || last_use[k] == usize::MAX) {
+                self.images[k] = None;
+                #[cfg(feature = "gpu")]
+                if let Some(g) = &mut self.gpu { g.release(k); }
             }
         }
     }

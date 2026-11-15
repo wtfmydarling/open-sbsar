@@ -463,7 +463,7 @@ pub struct RenderStats {
 ///
 /// A node is reused when none of the graph inputs its functions read changed, none of its
 /// input nodes was recomputed, and the value-processor values it read are the same. Results
-/// are kept within a memory budget (default 1 GiB; [`Instance::set_cache_budget`]); what does
+/// are kept within a memory budget (default 512 MiB; [`Instance::set_cache_budget`]); what does
 /// not fit is recomputed when needed. Use one instance with one renderer: rendering with
 /// another renderer, or rendering anything else on the same renderer in between, makes the
 /// next render a full one. GPU results stay on the renderer's device.
@@ -506,7 +506,7 @@ impl Instance {
             inputs: HashMap::new(),
             strings: HashMap::new(),
             image_inputs: HashMap::new(),
-            budget: 1 << 30,
+            budget: 512 << 20,
             stats: RenderStats::default(),
         }
     }

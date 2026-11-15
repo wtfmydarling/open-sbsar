@@ -38,7 +38,7 @@ pub const XF: (&str, &str) = ("transformation", include_str!("gpu_xf.wgsl"));
 pub const ATOMIC: (&str, &str) = ("atomic", concat!(include_str!("gpu_sample.wgsl"), include_str!("gpu_atomic.wgsl")));
 
 /// Upper bound of the bytes of released image buffers kept for reuse.
-const POOL_BYTES: u64 = 1 << 30;
+const POOL_BYTES: u64 = 512 << 20;
 
 pub struct Gpu {
     device: wgpu::Device,

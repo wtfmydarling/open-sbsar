@@ -69,7 +69,7 @@ for out in renderer.render(graph, &params, None)? {         // None: every image
   recomputing only the nodes whose result can change; its outputs are byte-identical to a full
   render. `instance.render(&mut renderer, graph, &params, None)`, then
   `instance.last_stats()` gives the nodes recomputed and reused. Results are kept within a
-  memory budget (`set_cache_budget`, default 1 GiB).
+  memory budget (`set_cache_budget`, default 512 MiB; on the GPU it is device memory).
 - **Reuse one renderer**: it keeps the GPU context and the compiled shaders between renders; the
   first render of a material compiles its shaders, later ones do not.
 - Errors (also internal failures) are returned as `open_sbsar::Error`; `renderer.warnings` lists
