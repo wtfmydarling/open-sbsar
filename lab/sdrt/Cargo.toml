@@ -25,7 +25,7 @@ path = "src/main.rs"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 rayon = "1.12"
 roxmltree = "0.21.2"
-sevenz-rust2 = { version = "0.25", default-features = false }
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2", "deflate", "ppmd", "brotli", "lz4", "zstd"] }
 
 [profile.release]
 debug = 1
