@@ -24,8 +24,11 @@ Version 0.1: usable, under active development.
   (except pixel-processor transcendentals and levels' gamma, which use the GPU's own functions,
   as Substance's GPU engine does). Validated on an NVIDIA RTX 4070 SUPER (Vulkan). A material at
   512² re-renders with new parameters in about 0.5 s once its shaders are compiled.
-- **Not yet**: graph image inputs (the API is in place; images are not evaluated yet), incremental
-  re-rendering of only the nodes a parameter change affects, WebAssembly/WebGPU.
+- **Image inputs** (curvature, ambient occlusion, position, normal maps…) are evaluated: pass
+  images with `Parameters::set_image` (CLI: `--set-image IDENT=path`).
+- **Pure Rust**: the `.sbsar` archive is read by the crate's own 7z reader; no external tools.
+- **Not yet**: incremental re-rendering of only the nodes a parameter change affects,
+  WebAssembly/WebGPU.
 
 ## Library
 
@@ -58,6 +61,11 @@ for out in renderer.render(graph, &params, None)? {         // None: every image
   and `wgpu::Queue` your application already uses (`open_sbsar::wgpu` is the wgpu version the
   crate is built with, currently 30). Nothing is requested from the device; an error names any
   limit that is too small.
+- **Image inputs**: `graph.inputs()` lists them with `kind == InputKind::Image`; connect one with
+  `params.set_image("curvature", InputImage { width, height, channels, data, storage })`, where
+  `data` holds `width * height * channels` f32 values in 0..1 (1 or 4 channels) and `storage`
+  is the source format (`U8`/`U16`/`F16`/`F32`). An image input that is not set uses the
+  graph's default (or transparent black).
 - **Reuse one renderer**: it keeps the GPU context and the compiled shaders between renders; the
   first render of a material compiles its shaders, later ones do not.
 - Errors (also internal failures) are returned as `open_sbsar::Error`; `renderer.warnings` lists
@@ -74,6 +82,7 @@ sdrt inputs FILE.sbsar                   # the graph's parameters
 sdrt node FILE.sbsar INDEX OUT.png       # one internal node (OUT.f32: raw RGBA f32)
 sdrt stats FILE.sbsar                    # every node: op, size, value ranges
     --set '$outputsize=10,10'            # set a parameter (log2 sizes here: 1024²)
+    --set-image IDENT=image.png          # connect an image input (PNG, JPEG, TIFF, EXR)
     --backend vulkan                     # the GPU path (the default is the CPU path)
 ```
 
