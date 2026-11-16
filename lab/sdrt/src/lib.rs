@@ -36,3 +36,21 @@ pub mod sevenz;
 mod text;
 #[doc(hidden)]
 pub mod vm;
+
+/// A safety limit against malformed programs was reached (real files never reach them;
+/// SDRT_CAPLOG=1 reports it on stderr).
+#[doc(hidden)]
+pub fn cap_hit(what: &str) {
+    if envc::var("SDRT_CAPLOG").is_ok() {
+        eprintln!("SDRT_CAP {what}");
+    }
+}
+
+/// Research aid (SDRT_CAPLOG=1): report new maxima of VM expression nesting above 48.
+#[doc(hidden)]
+pub fn depth_seen(d: usize) {
+    static MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(48);
+    if MAX.fetch_max(d, std::sync::atomic::Ordering::Relaxed) < d && envc::var("SDRT_CAPLOG").is_ok() {
+        eprintln!("SDRT_DEPTH {d}");
+    }
+}

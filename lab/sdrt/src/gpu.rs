@@ -61,6 +61,8 @@ pub struct Gpu {
     read_pool: HashMap<u64, Vec<wgpu::Buffer>>,
     /// bytes of the buffers in `pool` (bounded by POOL_BYTES)
     pooled: u64,
+    /// bytes of the buffers in `read_pool` (bounded by POOL_BYTES)
+    read_pooled: u64,
     params_pending: Vec<wgpu::Buffer>,
 }
 impl Gpu {
@@ -177,6 +179,7 @@ impl Gpu {
             pending_buffers: Vec::new(),
             read_pool: HashMap::new(),
             pooled: 0,
+            read_pooled: 0,
             params_pending: Vec::new(),
         })
     }
@@ -239,21 +242,29 @@ impl Gpu {
         self.pool.clear();
         self.read_pool.clear();
         self.pooled = 0;
+        self.read_pooled = 0;
     }
 
     fn get_read_buffer(&mut self, bytes: u64) -> wgpu::Buffer {
-        self.read_pool.entry(bytes).or_default().pop().unwrap_or_else(|| {
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("CPU boundary readback"),
-                size: bytes,
-                mapped_at_creation: false,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            })
+        if let Some(list) = self.read_pool.get_mut(&bytes) {
+            if let Some(buf) = list.pop() {
+                self.read_pooled -= bytes;
+                return buf;
+            }
+        }
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("CPU boundary readback"),
+            size: bytes,
+            mapped_at_creation: false,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         })
     }
 
     fn recycle_read_buffer(&mut self, bytes: u64, buf: wgpu::Buffer) {
-        self.read_pool.entry(bytes).or_default().push(buf);
+        if self.read_pooled + bytes <= POOL_BYTES {
+            self.read_pooled += bytes;
+            self.read_pool.entry(bytes).or_default().push(buf);
+        }
     }
 
     pub fn limits(&self) -> wgpu::Limits {

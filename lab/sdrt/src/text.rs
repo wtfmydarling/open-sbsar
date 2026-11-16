@@ -486,6 +486,10 @@ fn quad(poly: &mut Vec<(f64, f64)>, a: (f64, f64), q: (f64, f64), b: (f64, f64),
 /// flatness² (`flat`, font units: 0.35 px over the scale). Points come back in font units.
 pub fn flatten_stb(contours: &[Vec<(f64, f64, bool)>], flat: f64) -> Vec<Vec<(f64, f64)>> {
     fn tess(poly: &mut Vec<(f64, f64)>, a: (f64, f64), q: (f64, f64), b: (f64, f64), f2: f64, n: u32) {
+        if poly.len() >= 50_000 {
+            crate::cap_hit("text poly");
+            return;
+        }
         let (mx, my) = ((a.0 + 2.0 * q.0 + b.0) / 4.0, (a.1 + 2.0 * q.1 + b.1) / 4.0);
         let (dx, dy) = ((a.0 + b.0) / 2.0 - mx, (a.1 + b.1) / 2.0 - my);
         if n <= 16 && dx * dx + dy * dy > f2 {
@@ -495,7 +499,7 @@ pub fn flatten_stb(contours: &[Vec<(f64, f64, bool)>], flat: f64) -> Vec<Vec<(f6
             poly.push(b);
         }
     }
-    let f2 = flat * flat;
+    let f2 = (flat * flat).max(1e-4);
     let half = |a: f64, b: f64| ((a as i64 + b as i64) >> 1) as f64;
     let mut out = vec![];
     for c in contours {

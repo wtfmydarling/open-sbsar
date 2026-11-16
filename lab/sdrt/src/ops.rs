@@ -599,6 +599,21 @@ impl<'p> Runtime<'p> {
                 }
             }
         }
+        if let Some(inc) = &mut self.incr {
+            let mut stale = vec![false; n];
+            for (i, nd) in self.p.nodes.iter().enumerate() {
+                if needed[i] {
+                    continue;
+                }
+                let r = &inc.reads[i];
+                stale[i] = r.uids.iter().any(|u| inc.changed.contains(u))
+                    || node_srcs(nd).iter().any(|&j| j < n && (j >= i || stale[j] || recomputed[j]));
+                if stale[i] && inc.cached[i] {
+                    inc.cached[i] = false;
+                    inc.used -= std::mem::take(&mut inc.bytes[i]);
+                }
+            }
+        }
         #[cfg(feature="gpu")]
         if let Some(gpu) = &mut self.gpu {
             gpu.flush();
@@ -2448,6 +2463,8 @@ impl<'p> Runtime<'p> {
                 3 if crate::env_once!("SDRT_SVGRGB").is_ok() => color = [((cnt >> 16) & 255) as f32 / 255.0, ((cnt >> 8) & 255) as f32 / 255.0, (cnt & 255) as f32 / 255.0, 1.0],
                 3 => color = [(cnt & 255) as f32 / 255.0, ((cnt >> 8) & 255) as f32 / 255.0, ((cnt >> 16) & 255) as f32 / 255.0, 1.0],
                 1 | 2 => {
+                    // a strip lies inside the program (malformed counts would allocate gigabytes)
+                    let cnt = cnt.min(p.b.len() / 4);
                     let snap = svg_snap;
                     // SDRT_SVGOFF=dx,dy: a vertex offset in pixels (test switch)
                     let off: (f64, f64) = crate::envc::var("SDRT_SVGOFF").ok().and_then(|s| { let v: Vec<f64> = s.split(',').filter_map(|t| t.parse().ok()).collect(); (v.len() == 2).then(|| (v[0], v[1])) }).unwrap_or((0.0, 0.0));

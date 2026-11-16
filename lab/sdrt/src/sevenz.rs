@@ -5,6 +5,15 @@
 
 use std::io::Read;
 
+/// Maximum total unpacked byte size across an entire archive (1 GiB).
+pub const MAX_UNPACKED: u64 = 1024 * 1024 * 1024;
+
+/// Maximum LZMA/LZMA2 dictionary size allowed (256 MiB).
+pub const MAX_DICT_SIZE: u32 = 256 * 1024 * 1024;
+
+/// Maximum encoded-header nesting depth (1 = one encoded header wrapping kHeader).
+const MAX_ENCODED_HEADER_DEPTH: usize = 1;
+
 /// One entry extracted from a 7z archive.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -61,9 +70,9 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Entry>, String> {
     }
 
     let header_start = 32usize
-        .checked_add(usize::try_from(next_header_offset).map_err(|_| "next header offset overflow")?)
+        .checked_add(u64_to_usize(next_header_offset, "next header offset")?)
         .ok_or("next header offset overflow")?;
-    let header_size = usize::try_from(next_header_size).map_err(|_| "next header size overflow")?;
+    let header_size = u64_to_usize(next_header_size, "next header size")?;
     let header_end = header_start.checked_add(header_size).ok_or("header range overflow")?;
 
     if header_end > bytes.len() {
@@ -76,29 +85,44 @@ pub fn read(bytes: &[u8]) -> Result<Vec<Entry>, String> {
         return Err("next header CRC mismatch".into());
     }
 
-    let mut r = Reader::new(header_slice);
-    let nid = r.read_u8()?;
+    let mut unpacked_budget = MAX_UNPACKED;
+    let mut header_buf: Vec<u8>;
+    let mut active_header: &[u8] = header_slice;
+    let mut depth = 0usize;
 
-    let (streams_info, files) = if nid == K_ENCODED_HEADER {
+    let (streams_info, files) = loop {
+        let mut r = Reader::new(active_header);
+        let nid = r.read_u8()?;
+        if nid == K_HEADER {
+            break read_header(&mut r)?;
+        }
+        if nid != K_ENCODED_HEADER {
+            return Err(format!("expected kHeader or kEncodedHeader, got 0x{nid:02X}"));
+        }
+        if depth >= MAX_ENCODED_HEADER_DEPTH {
+            return Err("encoded header nesting depth exceeded".into());
+        }
+        depth += 1;
+
         let enc_streams = read_streams_info(&mut r)?;
-        if enc_streams.folders.is_empty() {
-            return Err("encoded header has no folders".into());
+        if enc_streams.folders.len() != 1 {
+            return Err(format!(
+                "encoded header must have exactly 1 folder, got {}",
+                enc_streams.folders.len()
+            ));
         }
+        validate_streams_info(&enc_streams, bytes.len(), &mut unpacked_budget)?;
         let mut sub_stream_idx = 0;
-        let unpacked_header_parts = decompress_folder(&enc_streams, 0, &mut sub_stream_idx, bytes)?;
-        let unpacked_header = unpacked_header_parts.into_iter().next().ok_or("empty unpacked header")?;
-        let mut hdr_r = Reader::new(&unpacked_header);
-        let main_nid = hdr_r.read_u8()?;
-        if main_nid != K_HEADER {
-            return Err(format!("expected kHeader inside encoded header, got 0x{main_nid:02X}"));
+        let unpacked_header_parts =
+            decompress_folder(&enc_streams, 0, &mut sub_stream_idx, bytes)?;
+        if unpacked_header_parts.len() != 1 {
+            return Err("encoded header must unpack to 1 stream".into());
         }
-        read_header(&mut hdr_r)?
-    } else if nid == K_HEADER {
-        read_header(&mut r)?
-    } else {
-        return Err(format!("expected kHeader or kEncodedHeader, got 0x{nid:02X}"));
+        header_buf = unpacked_header_parts.into_iter().next().unwrap();
+        active_header = &header_buf;
     };
 
+    validate_streams_info(&streams_info, bytes.len(), &mut unpacked_budget)?;
     assemble_entries(&streams_info, files, bytes)
 }
 
@@ -109,6 +133,8 @@ fn read_header(r: &mut Reader) -> Result<(StreamsInfo, Vec<FileMetadata>), Strin
         sub_streams: None,
     };
     let mut files = Vec::new();
+    let mut seen_streams = false;
+    let mut seen_files = false;
 
     loop {
         let nid = r.read_u8()?;
@@ -120,7 +146,7 @@ fn read_header(r: &mut Reader) -> Result<(StreamsInfo, Vec<FileMetadata>), Strin
                     if pid == K_END {
                         break;
                     }
-                    let sz = r.read_varint()? as usize;
+                    let sz = r.read_varint_usize("archive property size")?;
                     r.skip(sz)?;
                 }
             }
@@ -128,9 +154,17 @@ fn read_header(r: &mut Reader) -> Result<(StreamsInfo, Vec<FileMetadata>), Strin
                 return Err("additional streams unsupported".into());
             }
             K_MAIN_STREAMS_INFO => {
+                if seen_streams {
+                    return Err("duplicate kMainStreamsInfo in header".into());
+                }
+                seen_streams = true;
                 streams_info = read_streams_info(r)?;
             }
             K_FILES_INFO => {
+                if seen_files {
+                    return Err("duplicate kFilesInfo in header".into());
+                }
+                seen_files = true;
                 files = read_files_info(r)?;
             }
             other => return Err(format!("unexpected nid 0x{other:02X} in header")),
@@ -140,11 +174,92 @@ fn read_header(r: &mut Reader) -> Result<(StreamsInfo, Vec<FileMetadata>), Strin
     Ok((streams_info, files))
 }
 
+fn validate_streams_info(
+    streams_info: &StreamsInfo,
+    archive_len: usize,
+    unpacked_budget: &mut u64,
+) -> Result<(), String> {
+    let total_pack_streams = streams_info
+        .folders
+        .iter()
+        .try_fold(0usize, |acc, f| acc.checked_add(f.packed_streams.len()))
+        .ok_or("total packed stream count overflow")?;
+
+    if !streams_info.folders.is_empty() {
+        let pack_info = streams_info
+            .pack_info
+            .as_ref()
+            .ok_or("archive has folders but no pack info")?;
+        if total_pack_streams > pack_info.pack_sizes.len() {
+            return Err("folders require more pack streams than pack info provides".into());
+        }
+        let mut cursor = 32usize
+            .checked_add(u64_to_usize(pack_info.pack_pos, "pack_pos")?)
+            .ok_or("pack start offset overflow")?;
+        for &sz in &pack_info.pack_sizes[..total_pack_streams] {
+            let sz_usize = u64_to_usize(sz, "pack stream size")?;
+            cursor = cursor
+                .checked_add(sz_usize)
+                .ok_or("pack stream end offset overflow")?;
+        }
+        if cursor > archive_len {
+            return Err("pack stream extends past end of archive".into());
+        }
+    }
+
+    let mut total_sub_streams = 0usize;
+    for folder in &streams_info.folders {
+        if folder.unpack_sizes.len() != folder.total_out_streams {
+            return Err("folder unpack_sizes length mismatch".into());
+        }
+        for &sz in &folder.unpack_sizes {
+            if sz > MAX_UNPACKED {
+                return Err(format!(
+                    "coder unpack size {sz} exceeds MAX_UNPACKED ({MAX_UNPACKED})"
+                ));
+            }
+            u64_to_usize(sz, "coder unpack size")?;
+        }
+        let folder_unpack = folder.total_unpack_size();
+        if folder_unpack > *unpacked_budget {
+            return Err(format!(
+                "archive total unpacked size exceeds MAX_UNPACKED ({MAX_UNPACKED})"
+            ));
+        }
+        *unpacked_budget -= folder_unpack;
+
+        if streams_info.sub_streams.is_none() && folder.num_sub_streams != 1 {
+            return Err("multiple sub-streams without kSubStreamsInfo".into());
+        }
+        total_sub_streams = total_sub_streams
+            .checked_add(folder.num_sub_streams)
+            .ok_or("total sub-stream count overflow")?;
+    }
+
+    if let Some(sub) = &streams_info.sub_streams {
+        if sub.unpack_sizes.len() != total_sub_streams {
+            return Err("sub-stream unpack_sizes count does not match folders".into());
+        }
+    }
+
+    Ok(())
+}
+
 fn assemble_entries(
     streams_info: &StreamsInfo,
     files: Vec<FileMetadata>,
     archive_bytes: &[u8],
 ) -> Result<Vec<Entry>, String> {
+    let streamed_files = files.iter().filter(|f| f.has_stream).count();
+    let total_sub_streams: usize = streams_info
+        .folders
+        .iter()
+        .try_fold(0usize, |acc, f| acc.checked_add(f.num_sub_streams))
+        .ok_or("total sub-stream count overflow")?;
+    if streamed_files > total_sub_streams {
+        return Err("more streamed files than folder streams available".into());
+    }
+
     let mut entries = Vec::with_capacity(cap(files.len()));
     let mut folder_idx = 0;
     let mut sub_stream_idx = 0;
@@ -161,7 +276,7 @@ fn assemble_entries(
             continue;
         }
 
-        if current_folder_pos >= current_folder_sub_streams.len() {
+        while current_folder_pos >= current_folder_sub_streams.len() {
             if folder_idx >= streams_info.folders.len() {
                 return Err("more streamed files than folder streams available".into());
             }
@@ -175,7 +290,10 @@ fn assemble_entries(
             folder_idx += 1;
         }
 
-        let data = std::mem::take(&mut current_folder_sub_streams[current_folder_pos]);
+        let slot = current_folder_sub_streams
+            .get_mut(current_folder_pos)
+            .ok_or("missing decompressed sub-stream")?;
+        let data = std::mem::take(slot);
         current_folder_pos += 1;
 
         entries.push(Entry {
@@ -186,6 +304,10 @@ fn assemble_entries(
     }
 
     Ok(entries)
+}
+
+fn u64_to_usize(v: u64, what: &str) -> Result<usize, String> {
+    usize::try_from(v).map_err(|_| format!("{what} ({v}) overflows usize"))
 }
 
 struct Reader<'a> {
@@ -203,10 +325,10 @@ impl<'a> Reader<'a> {
     }
 
     fn read_u8(&mut self) -> Result<u8, String> {
-        if self.pos >= self.data.len() {
-            return Err("unexpected end of 7z header stream".into());
-        }
-        let b = self.data[self.pos];
+        let b = *self
+            .data
+            .get(self.pos)
+            .ok_or("unexpected end of 7z header stream")?;
         self.pos += 1;
         Ok(b)
     }
@@ -215,8 +337,9 @@ impl<'a> Reader<'a> {
         if self.remaining() < len {
             return Err("unexpected end of 7z header stream while reading slice".into());
         }
-        let slice = &self.data[self.pos..self.pos + len];
-        self.pos += len;
+        let end = self.pos + len;
+        let slice = &self.data[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -248,7 +371,16 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    fn read_varint_usize(&mut self, what: &str) -> Result<usize, String> {
+        let v = self.read_varint()?;
+        u64_to_usize(v, what)
+    }
+
     fn read_bits(&mut self, count: usize) -> Result<Vec<bool>, String> {
+        let needed_bytes = count.div_ceil(8);
+        if needed_bytes > self.remaining() {
+            return Err("bitmask count exceeds remaining header length".into());
+        }
         let mut bits = Vec::with_capacity(cap(count));
         let mut mask = 0u8;
         let mut cache = 0u8;
@@ -264,6 +396,9 @@ impl<'a> Reader<'a> {
     }
 
     fn read_all_or_bits(&mut self, count: usize) -> Result<Vec<bool>, String> {
+        if count > self.data.len() {
+            return Err("bitmask count exceeds header length".into());
+        }
         let all = self.read_u8()? != 0;
         if all {
             Ok(vec![true; count])
@@ -366,20 +501,33 @@ fn read_streams_info(r: &mut Reader) -> Result<StreamsInfo, String> {
 
 fn read_pack_info(r: &mut Reader) -> Result<PackInfo, String> {
     let pack_pos = r.read_varint()?;
-    let num_pack_streams = r.read_varint()? as usize;
+    let num_pack_streams = r.read_varint_usize("num_pack_streams")?;
+    if num_pack_streams > r.remaining() {
+        return Err("pack stream count exceeds remaining header length".into());
+    }
     let mut pack_sizes = Vec::with_capacity(cap(num_pack_streams));
     let mut pack_crcs = vec![None; num_pack_streams];
+    let mut seen_sizes = false;
+    let mut seen_crcs = false;
 
     loop {
         let nid = r.read_u8()?;
         match nid {
             K_END => break,
             K_SIZE => {
+                if seen_sizes {
+                    return Err("duplicate kSize in pack info".into());
+                }
+                seen_sizes = true;
                 for _ in 0..num_pack_streams {
                     pack_sizes.push(r.read_varint()?);
                 }
             }
             K_CRC => {
+                if seen_crcs {
+                    return Err("duplicate kCRC in pack info".into());
+                }
+                seen_crcs = true;
                 let defined = r.read_all_or_bits(num_pack_streams)?;
                 for i in 0..num_pack_streams {
                     if defined[i] {
@@ -391,6 +539,10 @@ fn read_pack_info(r: &mut Reader) -> Result<PackInfo, String> {
         }
     }
 
+    if num_pack_streams > 0 && !seen_sizes {
+        return Err("missing kSize in pack info".into());
+    }
+
     Ok(PackInfo {
         pack_pos,
         pack_sizes,
@@ -398,11 +550,101 @@ fn read_pack_info(r: &mut Reader) -> Result<PackInfo, String> {
     })
 }
 
+fn validate_folder_graph(
+    coders: &[Coder],
+    total_in: usize,
+    total_out: usize,
+    bind_pairs: &[BindPair],
+    packed_streams: &[usize],
+) -> Result<(), String> {
+    let mut used_in = vec![false; total_in];
+    let mut used_out = vec![false; total_out];
+
+    for bp in bind_pairs {
+        if bp.in_index >= total_in {
+            return Err(format!(
+                "bind pair in_index {} out of range (total_in={total_in})",
+                bp.in_index
+            ));
+        }
+        if bp.out_index >= total_out {
+            return Err(format!(
+                "bind pair out_index {} out of range (total_out={total_out})",
+                bp.out_index
+            ));
+        }
+        if used_in[bp.in_index] {
+            return Err(format!("duplicate bind pair in_index {}", bp.in_index));
+        }
+        if used_out[bp.out_index] {
+            return Err(format!("duplicate bind pair out_index {}", bp.out_index));
+        }
+        used_in[bp.in_index] = true;
+        used_out[bp.out_index] = true;
+    }
+
+    let mut seen_packed = vec![false; total_in];
+    for &ps in packed_streams {
+        if ps >= total_in {
+            return Err(format!(
+                "packed stream index {ps} out of range (total_in={total_in})"
+            ));
+        }
+        if used_in[ps] {
+            return Err(format!("packed stream index {ps} is already bound"));
+        }
+        if seen_packed[ps] {
+            return Err(format!("duplicate packed stream index {ps}"));
+        }
+        seen_packed[ps] = true;
+    }
+
+    // Build stream -> coder maps and check for cycles in the coder DAG via Kahn's algorithm.
+    let mut in_to_coder = Vec::with_capacity(total_in);
+    let mut out_to_coder = Vec::with_capacity(total_out);
+    for (ci, c) in coders.iter().enumerate() {
+        in_to_coder.extend(std::iter::repeat_n(ci, c.num_in_streams));
+        out_to_coder.extend(std::iter::repeat_n(ci, c.num_out_streams));
+    }
+
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); coders.len()];
+    let mut in_deg = vec![0usize; coders.len()];
+    for bp in bind_pairs {
+        let src = out_to_coder[bp.out_index];
+        let dst = in_to_coder[bp.in_index];
+        if src == dst {
+            return Err("cycle detected in folder bind pairs (self-loop)".into());
+        }
+        adj[src].push(dst);
+        in_deg[dst] += 1;
+    }
+
+    let mut stack: Vec<usize> = (0..coders.len()).filter(|&i| in_deg[i] == 0).collect();
+    let mut visited = 0usize;
+    while let Some(u) = stack.pop() {
+        visited += 1;
+        for &v in &adj[u] {
+            in_deg[v] -= 1;
+            if in_deg[v] == 0 {
+                stack.push(v);
+            }
+        }
+    }
+    if visited != coders.len() {
+        return Err("cycle detected in folder bind pairs".into());
+    }
+
+    Ok(())
+}
+
 fn read_unpack_info(r: &mut Reader) -> Result<Vec<Folder>, String> {
     if r.read_u8()? != K_FOLDER {
         return Err("expected kFolder".into());
     }
-    let num_folders = r.read_varint()? as usize;
+    let num_folders = r.read_varint_usize("num_folders")?;
+    if num_folders > r.remaining() {
+        return Err("folder count exceeds remaining header length".into());
+    }
     let external = r.read_u8()?;
     if external != 0 {
         return Err("external unpack info unsupported".into());
@@ -410,7 +652,10 @@ fn read_unpack_info(r: &mut Reader) -> Result<Vec<Folder>, String> {
 
     let mut folders = Vec::with_capacity(cap(num_folders));
     for _ in 0..num_folders {
-        let num_coders = r.read_varint()? as usize;
+        let num_coders = r.read_varint_usize("num_coders")?;
+        if num_coders == 0 || num_coders > r.remaining() {
+            return Err("invalid coder count in folder".into());
+        }
         let mut coders = Vec::with_capacity(cap(num_coders));
         let mut total_in = 0usize;
         let mut total_out = 0usize;
@@ -425,14 +670,27 @@ fn read_unpack_info(r: &mut Reader) -> Result<Vec<Folder>, String> {
             }
             let method_id = r.read_exact(id_size)?.to_vec();
             let (num_in, num_out) = if is_simple {
-                (1, 1)
+                (1usize, 1usize)
             } else {
-                (r.read_varint()? as usize, r.read_varint()? as usize)
+                (
+                    r.read_varint_usize("coder num_in_streams")?,
+                    r.read_varint_usize("coder num_out_streams")?,
+                )
             };
-            total_in += num_in;
-            total_out += num_out;
+            total_in = total_in
+                .checked_add(num_in)
+                .ok_or("folder total_in overflow")?;
+            total_out = total_out
+                .checked_add(num_out)
+                .ok_or("folder total_out overflow")?;
+            if total_out > r.remaining() {
+                return Err("folder output stream count exceeds remaining header length".into());
+            }
+            if total_in > r.remaining().saturating_mul(2).saturating_add(1) {
+                return Err("folder input stream count exceeds remaining header length".into());
+            }
             let properties = if has_props {
-                let prop_size = r.read_varint()? as usize;
+                let prop_size = r.read_varint_usize("coder property size")?;
                 r.read_exact(prop_size)?.to_vec()
             } else {
                 Vec::new()
@@ -449,17 +707,23 @@ fn read_unpack_info(r: &mut Reader) -> Result<Vec<Folder>, String> {
             return Err("folder has 0 output streams".into());
         }
         let num_bind_pairs = total_out - 1;
+        if num_bind_pairs.saturating_mul(2) > r.remaining() {
+            return Err("bind pair count exceeds remaining header length".into());
+        }
         let mut bind_pairs = Vec::with_capacity(cap(num_bind_pairs));
         for _ in 0..num_bind_pairs {
             bind_pairs.push(BindPair {
-                in_index: r.read_varint()? as usize,
-                out_index: r.read_varint()? as usize,
+                in_index: r.read_varint_usize("bind pair in_index")?,
+                out_index: r.read_varint_usize("bind pair out_index")?,
             });
         }
 
         let num_packed_streams = total_in
             .checked_sub(num_bind_pairs)
             .ok_or_else(|| "total_in < num_bind_pairs".to_string())?;
+        if num_packed_streams == 0 {
+            return Err("folder has 0 packed streams".into());
+        }
         let mut packed_streams = Vec::with_capacity(cap(num_packed_streams));
         if num_packed_streams == 1 {
             let mut found = None;
@@ -471,10 +735,15 @@ fn read_unpack_info(r: &mut Reader) -> Result<Vec<Folder>, String> {
             }
             packed_streams.push(found.ok_or_else(|| "cannot find packed stream index".to_string())?);
         } else {
+            if num_packed_streams > r.remaining() {
+                return Err("packed stream count exceeds remaining header length".into());
+            }
             for _ in 0..num_packed_streams {
-                packed_streams.push(r.read_varint()? as usize);
+                packed_streams.push(r.read_varint_usize("packed stream index")?);
             }
         }
+
+        validate_folder_graph(&coders, total_in, total_out, &bind_pairs, &packed_streams)?;
 
         folders.push(Folder {
             coders,
@@ -497,11 +766,16 @@ fn read_unpack_info(r: &mut Reader) -> Result<Vec<Folder>, String> {
         }
     }
 
+    let mut seen_crc = false;
     loop {
         let nid = r.read_u8()?;
         match nid {
             K_END => break,
             K_CRC => {
+                if seen_crc {
+                    return Err("duplicate kCRC in unpack info".into());
+                }
+                seen_crc = true;
                 let defined = r.read_all_or_bits(num_folders)?;
                 for i in 0..num_folders {
                     if defined[i] {
@@ -523,24 +797,41 @@ fn read_sub_streams_info(r: &mut Reader, folders: &mut [Folder]) -> Result<SubSt
 
     let mut nid = r.read_u8()?;
     if nid == K_NUM_UNPACK_STREAM {
+        let mut total_sub = 0usize;
         for folder in folders.iter_mut() {
-            folder.num_sub_streams = r.read_varint()? as usize;
+            let n = r.read_varint_usize("num_sub_streams")?;
+            total_sub = total_sub
+                .checked_add(n)
+                .ok_or("total sub-stream count overflow")?;
+            if n > r.remaining().saturating_add(1) {
+                return Err("sub-stream count exceeds remaining header length".into());
+            }
+            folder.num_sub_streams = n;
         }
         nid = r.read_u8()?;
     }
 
+    let has_k_size = nid == K_SIZE;
     let mut unpack_sizes = Vec::new();
     for folder in folders.iter() {
+        let total_unpack = folder.total_unpack_size();
         if folder.num_sub_streams == 0 {
+            if total_unpack != 0 {
+                return Err("folder with 0 sub-streams has non-zero unpack size".into());
+            }
             continue;
         }
-        let total_unpack = folder.total_unpack_size();
+        if folder.num_sub_streams > 1 && !has_k_size {
+            return Err("missing kSize for folder with multiple sub-streams".into());
+        }
         let mut sum = 0u64;
-        if nid == K_SIZE {
+        if has_k_size {
             for _ in 0..folder.num_sub_streams - 1 {
                 let sz = r.read_varint()?;
+                sum = sum
+                    .checked_add(sz)
+                    .ok_or("sub-stream size sum overflow")?;
                 unpack_sizes.push(sz);
-                sum += sz;
             }
         }
         if sum > total_unpack {
@@ -548,15 +839,20 @@ fn read_sub_streams_info(r: &mut Reader, folders: &mut [Folder]) -> Result<SubSt
         }
         unpack_sizes.push(total_unpack - sum);
     }
-    if nid == K_SIZE {
+    if has_k_size {
         nid = r.read_u8()?;
     }
 
-    let mut num_digests = 0;
+    let mut num_digests = 0usize;
     for folder in folders.iter() {
         if folder.num_sub_streams != 1 || folder.crc.is_none() {
-            num_digests += folder.num_sub_streams;
+            num_digests = num_digests
+                .checked_add(folder.num_sub_streams)
+                .ok_or("sub-stream digest count overflow")?;
         }
+    }
+    if num_digests > r.data.len() {
+        return Err("sub-stream digest count exceeds header length".into());
     }
 
     let mut missing_crcs = vec![None; num_digests];
@@ -591,34 +887,64 @@ fn read_sub_streams_info(r: &mut Reader, folders: &mut [Folder]) -> Result<SubSt
 }
 
 fn read_files_info(r: &mut Reader) -> Result<Vec<FileMetadata>, String> {
-    let num_files = r.read_varint()? as usize;
-    let mut is_empty_stream = None;
-    let mut is_empty_file = None;
+    let num_files = r.read_varint_usize("num_files")?;
+    if num_files > r.remaining() {
+        return Err("file count exceeds remaining header length".into());
+    }
+    let mut is_empty_stream: Option<Vec<bool>> = None;
+    let mut is_empty_file: Option<Vec<bool>> = None;
     let mut names = Vec::with_capacity(cap(num_files));
+    let mut seen_names = false;
 
     loop {
         let prop_type = r.read_u8()?;
         if prop_type == 0 {
             break;
         }
-        let size = r.read_varint()? as usize;
+        let size = r.read_varint_usize("file property size")?;
+        if size > r.remaining() {
+            return Err("file property size exceeds remaining header length".into());
+        }
         match prop_type {
             K_EMPTY_STREAM => {
+                if is_empty_stream.is_some() {
+                    return Err("duplicate kEmptyStream property".into());
+                }
+                let start = r.pos;
                 is_empty_stream = Some(r.read_bits(num_files)?);
+                let consumed = r.pos - start;
+                if consumed > size {
+                    return Err("kEmptyStream exceeds declared property size".into());
+                }
+                r.skip(size - consumed)?;
             }
             K_EMPTY_FILE => {
-                let count = is_empty_stream
+                if is_empty_file.is_some() {
+                    return Err("duplicate kEmptyFile property".into());
+                }
+                let empty_stream = is_empty_stream
                     .as_ref()
-                    .map_or(0, |s| s.iter().filter(|&&b| b).count());
+                    .ok_or("kEmptyFile without preceding kEmptyStream")?;
+                let count = empty_stream.iter().filter(|&&b| b).count();
+                let start = r.pos;
                 is_empty_file = Some(r.read_bits(count)?);
+                let consumed = r.pos - start;
+                if consumed > size {
+                    return Err("kEmptyFile exceeds declared property size".into());
+                }
+                r.skip(size - consumed)?;
             }
             K_NAME => {
+                if seen_names {
+                    return Err("duplicate kName property".into());
+                }
+                seen_names = true;
+                if size == 0 {
+                    return Err("invalid empty file names property".into());
+                }
                 let external = r.read_u8()?;
                 if external != 0 {
                     return Err("external file names unsupported".into());
-                }
-                if size == 0 {
-                    return Err("invalid empty file names property".into());
                 }
                 let bytes = r.read_exact(size - 1)?;
                 let mut current_utf16 = Vec::new();
@@ -645,14 +971,18 @@ fn read_files_info(r: &mut Reader) -> Result<Vec<FileMetadata>, String> {
     }
 
     let mut files = Vec::with_capacity(cap(num_files));
-    let mut empty_idx = 0;
+    let mut empty_idx = 0usize;
     for (i, name) in names.into_iter().enumerate() {
-        let empty = is_empty_stream.as_ref().map_or(false, |s| s[i]);
+        let empty = match is_empty_stream.as_ref() {
+            Some(s) => *s.get(i).ok_or("kEmptyStream bitmask length mismatch")?,
+            None => false,
+        };
         let (has_stream, is_directory) = if !empty {
             (true, false)
         } else {
             let is_dir = if let Some(ef) = &is_empty_file {
-                !ef[empty_idx]
+                !*ef.get(empty_idx)
+                    .ok_or("kEmptyFile bitmask length mismatch")?
             } else {
                 true
             };
@@ -675,32 +1005,45 @@ fn decompress_folder(
     sub_stream_idx: &mut usize,
     archive_bytes: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
-    let folder = &streams_info.folders[folder_idx];
+    let folder = streams_info
+        .folders
+        .get(folder_idx)
+        .ok_or("folder index out of bounds")?;
     let pack_info = streams_info
         .pack_info
         .as_ref()
         .ok_or("archive has folders but no pack info")?;
 
-    let first_pack_stream_index: usize = streams_info.folders[..folder_idx]
+    let prior_folders = streams_info
+        .folders
+        .get(..folder_idx)
+        .ok_or("folder slice out of bounds")?;
+    let first_pack_stream_index: usize = prior_folders
         .iter()
-        .map(|f| f.packed_streams.len())
-        .sum();
+        .try_fold(0usize, |acc, f| acc.checked_add(f.packed_streams.len()))
+        .ok_or("pack stream index overflow")?;
 
     if folder.packed_streams.len() != 1 {
         return Err("multi-pack-stream folders unsupported".into());
     }
 
-    let pack_offset: u64 = pack_info.pack_sizes[..first_pack_stream_index]
+    let prior_pack_sizes = pack_info
+        .pack_sizes
+        .get(..first_pack_stream_index)
+        .ok_or("pack stream index out of bounds")?;
+    let pack_offset = prior_pack_sizes
         .iter()
-        .sum();
-    let pack_size = *pack_info
+        .try_fold(0u64, |acc, &x| acc.checked_add(x))
+        .ok_or("pack offset overflow")?;
+    let pack_size_u64 = *pack_info
         .pack_sizes
         .get(first_pack_stream_index)
-        .ok_or("pack stream index out of bounds")? as usize;
+        .ok_or("pack stream index out of bounds")?;
+    let pack_size = u64_to_usize(pack_size_u64, "pack stream size")?;
 
     let pack_start = 32usize
-        .checked_add(usize::try_from(pack_info.pack_pos).map_err(|_| "pack_pos overflow")?)
-        .and_then(|v| v.checked_add(usize::try_from(pack_offset).map_err(|_| "pack_offset overflow").ok()?))
+        .checked_add(u64_to_usize(pack_info.pack_pos, "pack_pos")?)
+        .and_then(|v| v.checked_add(u64_to_usize(pack_offset, "pack_offset").ok()?))
         .ok_or("pack start offset overflow")?;
     let pack_end = pack_start.checked_add(pack_size).ok_or("pack range overflow")?;
 
@@ -716,8 +1059,8 @@ fn decompress_folder(
     }
 
     let mut curr_coder_idx = folder.packed_streams[0];
-    let mut current_data = packed_slice.to_vec();
-    let mut visited_count = 0;
+    let mut owned_data: Option<Vec<u8>> = None;
+    let mut visited_count = 0usize;
 
     loop {
         if visited_count > folder.coders.len() {
@@ -737,15 +1080,25 @@ fn decompress_folder(
             .get(curr_coder_idx)
             .ok_or("missing unpack size for coder")?;
 
-        let next_data = decompress_coder(coder, &current_data, unpack_size)?;
+        let input_ref: &[u8] = match owned_data.as_deref() {
+            Some(buf) => buf,
+            None => packed_slice,
+        };
+        let next_data = decompress_coder(coder, input_ref, unpack_size)?;
 
         if let Some(bp) = folder.bind_pairs.iter().find(|bp| bp.out_index == curr_coder_idx) {
             curr_coder_idx = bp.in_index;
-            current_data = next_data;
+            owned_data = Some(next_data);
         } else {
-            current_data = next_data;
+            owned_data = Some(next_data);
             break;
         }
+    }
+
+    let current_data = owned_data.ok_or("folder produced no output")?;
+
+    if current_data.len() as u64 != folder.total_unpack_size() {
+        return Err("folder unpacked data length does not match declared folder size".into());
     }
 
     if let Some(folder_crc) = folder.crc {
@@ -757,17 +1110,43 @@ fn decompress_folder(
     let mut sub_streams = Vec::with_capacity(cap(folder.num_sub_streams));
     let mut offset = 0usize;
 
-    for _ in 0..folder.num_sub_streams {
+    if folder.num_sub_streams == 1 {
         let (sz, expected_crc) = if let Some(sub_info) = &streams_info.sub_streams {
-            let sz = *sub_info
+            let sz_u64 = *sub_info
                 .unpack_sizes
                 .get(*sub_stream_idx)
-                .ok_or("missing sub-stream unpack size")? as usize;
+                .ok_or("missing sub-stream unpack size")?;
+            let sz = u64_to_usize(sz_u64, "sub-stream unpack size")?;
             let crc = sub_info.crcs.get(*sub_stream_idx).copied().flatten();
             *sub_stream_idx += 1;
             (sz, crc)
         } else {
             (current_data.len(), folder.crc)
+        };
+        if sz != current_data.len() {
+            return Err("sum of sub-stream sizes does not match folder unpack size".into());
+        }
+        if let Some(crc) = expected_crc {
+            if crc32fast::hash(&current_data) != crc {
+                return Err("sub-stream CRC mismatch".into());
+            }
+        }
+        sub_streams.push(current_data);
+        return Ok(sub_streams);
+    }
+
+    for _ in 0..folder.num_sub_streams {
+        let (sz, expected_crc) = if let Some(sub_info) = &streams_info.sub_streams {
+            let sz_u64 = *sub_info
+                .unpack_sizes
+                .get(*sub_stream_idx)
+                .ok_or("missing sub-stream unpack size")?;
+            let sz = u64_to_usize(sz_u64, "sub-stream unpack size")?;
+            let crc = sub_info.crcs.get(*sub_stream_idx).copied().flatten();
+            *sub_stream_idx += 1;
+            (sz, crc)
+        } else {
+            return Err("multiple sub-streams without kSubStreamsInfo".into());
         };
 
         let end = offset.checked_add(sz).ok_or("sub-stream offset overflow")?;
@@ -793,6 +1172,13 @@ fn decompress_folder(
 }
 
 fn decompress_coder(coder: &Coder, input: &[u8], uncompressed_size: u64) -> Result<Vec<u8>, String> {
+    if uncompressed_size > MAX_UNPACKED {
+        return Err(format!(
+            "declared unpack size {uncompressed_size} exceeds MAX_UNPACKED ({MAX_UNPACKED})"
+        ));
+    }
+    let unpack_usize = u64_to_usize(uncompressed_size, "coder unpack size")?;
+
     // Copy coder: empty method ID or 0x00
     if coder.method_id.is_empty() || coder.method_id == [0x00] {
         if input.len() as u64 != uncompressed_size {
@@ -807,12 +1193,31 @@ fn decompress_coder(coder: &Coder, input: &[u8], uncompressed_size: u64) -> Resu
 
     // LZMA: [0x03, 0x01, 0x01]
     if coder.method_id == [0x03, 0x01, 0x01] {
-        if coder.properties.len() < 5 {
-            return Err("LZMA properties too short (< 5 bytes)".into());
+        if coder.properties.len() != 5 {
+            return Err(format!(
+                "LZMA properties must be 5 bytes, got {}",
+                coder.properties.len()
+            ));
         }
         let props = coder.properties[0];
+        if props > 224 {
+            return Err(format!("invalid LZMA properties byte: {props}"));
+        }
+        let pb = props / 45;
+        let rem = props % 45;
+        let lp = rem / 9;
+        let lc = rem % 9;
+        if lc > 8 || lp > 4 || pb > 4 {
+            return Err(format!("invalid LZMA properties lc={lc} lp={lp} pb={pb}"));
+        }
         let dict_size = u32::from_le_bytes(coder.properties[1..5].try_into().unwrap());
-        let mut reader = lzma_rust2::LzmaReader::new_with_props(
+        if dict_size > MAX_DICT_SIZE {
+            return Err(format!(
+                "LZMA dictionary size {dict_size} exceeds MAX_DICT_SIZE ({MAX_DICT_SIZE})"
+            ));
+        }
+
+        let reader = lzma_rust2::LzmaReader::new_with_props(
             input,
             uncompressed_size,
             props,
@@ -821,8 +1226,9 @@ fn decompress_coder(coder: &Coder, input: &[u8], uncompressed_size: u64) -> Resu
         )
         .map_err(|e| format!("LZMA initialization failed: {e}"))?;
 
-        let mut out = Vec::with_capacity(cap(uncompressed_size as usize));
+        let mut out = Vec::with_capacity(cap(unpack_usize));
         reader
+            .take(uncompressed_size)
             .read_to_end(&mut out)
             .map_err(|e| format!("LZMA decompression failed: {e}"))?;
         if out.len() as u64 != uncompressed_size {
@@ -837,8 +1243,11 @@ fn decompress_coder(coder: &Coder, input: &[u8], uncompressed_size: u64) -> Resu
 
     // LZMA2: [0x21]
     if coder.method_id == [0x21] {
-        if coder.properties.is_empty() {
-            return Err("LZMA2 properties too short (empty)".into());
+        if coder.properties.len() != 1 {
+            return Err(format!(
+                "LZMA2 properties must be 1 byte, got {}",
+                coder.properties.len()
+            ));
         }
         let prop = coder.properties[0] as u32;
         if (prop & !0x3F) != 0 {
@@ -851,9 +1260,14 @@ fn decompress_coder(coder: &Coder, input: &[u8], uncompressed_size: u64) -> Resu
         } else {
             (2 | (prop & 1)) << (prop / 2 + 11)
         };
+        if dict_size > MAX_DICT_SIZE {
+            return Err(format!(
+                "LZMA2 dictionary size {dict_size} exceeds MAX_DICT_SIZE ({MAX_DICT_SIZE})"
+            ));
+        }
 
         let reader = lzma_rust2::Lzma2Reader::new(input, dict_size, None);
-        let mut out = Vec::with_capacity(cap(uncompressed_size as usize));
+        let mut out = Vec::with_capacity(cap(unpack_usize));
         reader
             .take(uncompressed_size)
             .read_to_end(&mut out)

@@ -62,6 +62,10 @@ required-features = ["gpu"]
 name = "incremental_check"
 required-features = ["gpu"]
 
+[[example]]
+name = "incr_scenarios"
+required-features = ["gpu"]
+
 [dependencies.wgpu]
 version = "30"
 optional = true

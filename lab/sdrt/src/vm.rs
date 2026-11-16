@@ -180,7 +180,7 @@ fn scalar_reads(ins: &[Ins], side: &[bool], k: usize, c: usize, out: &mut Vec<(u
             if c < na { push(op(0), c) } else { push(op(1), c - na) }
         }
         15 => push(op(c.min(3)), 0),
-        16 => push(op(0), ((i.ops[1] >> (2 * c)) & 3) as usize),
+        16 => push(op(0), ((i.ops.get(1).copied().unwrap_or(0) >> (2 * c)) & 3) as usize),
         18..=22 | 48 | 49 | 54 => {
             for r in [op(0), op(1)] {
                 let zero_ext = i.op != 20 && c > 0 && r < n && comps(ins[r].ty) == 1 && comps(i.ty) > 1;
@@ -244,13 +244,22 @@ impl Func {
     pub fn decode(p: &Program, off: usize) -> Func {
         let b = &p.b;
         let mut o = p.base + off;
-        let rd = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
-        let n = rd(o) as usize;
+        let rd = |o: usize| if o + 1 < b.len() { u16::from_le_bytes([b[o], b[o + 1]]) } else { 0 };
+        if o + 2 > b.len() {
+            return Func { ins: vec![], side: vec![], hoist: vec![], lits: vec![], loop_inv: vec![], off };
+        }
+        let n = (rd(o) as usize).min(65536);
         o += 2;
-        let mut ins = Vec::with_capacity(n);
+        let mut ins = Vec::with_capacity(n.min(4096));
         for _ in 0..n {
+            if o + 2 > b.len() {
+                break;
+            }
             let h = rd(o);
             let k = (h >> 10) as usize;
+            if o + 2 + 2 * k > b.len() {
+                break;
+            }
             let ops: Vec<u16> = (0..k).map(|j| rd(o + 2 + 2 * j)).collect();
             ins.push(Ins { op: (h & 0x3F) as u8, ty: ((h >> 6) & 0xF) as u8, ops: Ops::from(&ops[..]) });
             o += 2 + 2 * k;
@@ -357,8 +366,10 @@ impl Func {
         let ins=&self.ins;
         let mut stack=if root<ins.len() {vec![(root,clamp_comp(ins,root,c))]} else {vec![]};
         let mut found=Vec::new(); let mut reads=Vec::new();
+        let mut seen = vec![[false; 4]; ins.len()];
         while let Some((r,rc))=stack.pop() {
-            if found.contains(&(r,rc)) {continue;}
+            if seen[r][rc] {continue;}
+            seen[r][rc] = true;
             if self.hoist[r][rc] {
                 if !matches!(ins[r].op,6|7|11) {found.push((r,rc));}
                 continue;
@@ -576,7 +587,7 @@ pub struct Prefill(Vec<(usize, [Option<S>; 4])>);
 
 /// Memo buffers an evaluator can reuse between evaluations (one per FX-Map render).
 #[derive(Default)]
-pub struct EvalBufs(Vec<[Option<S>; 4]>, Vec<Option<Value>>);
+pub struct EvalBufs(Vec<[Option<S>; 4]>, Vec<Option<Value>>, Vec<[bool; 4]>, Vec<bool>);
 
 pub struct Eval<'a, E: Env> {
     f: &'a Func,
@@ -584,6 +595,9 @@ pub struct Eval<'a, E: Env> {
     memo: Vec<[Option<S>; 4]>,
     /// Whole values of registers evaluated at once (samplers, loops, writes).
     whole: Vec<Option<Value>>,
+    in_comp: Vec<[bool; 4]>,
+    in_whole: Vec<bool>,
+    call_depth: usize,
     /// Variables: (index, value), few per function.
     pub vars: Vec<(u16, Value)>,
     /// The variables as a slot-indexed table, built at the first access (big pixel processors read
@@ -601,23 +615,34 @@ pub struct Eval<'a, E: Env> {
 
 thread_local! {
     /// Memo buffers reused between evaluations (one function per pixel adds up).
-    static SCRATCH: std::cell::RefCell<Vec<(Vec<[Option<S>; 4]>, Vec<Option<Value>>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SCRATCH: std::cell::RefCell<Vec<(Vec<[Option<S>; 4]>, Vec<Option<Value>>, Vec<[bool; 4]>, Vec<bool>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl<'a, E: Env> Eval<'a, E> {
     pub fn new(f: &'a Func, env: &'a mut E) -> Self {
-        let (memo, whole) = SCRATCH.with(|s| s.borrow_mut().pop()).unwrap_or_default();
-        Self::with_bufs(f, env, memo, whole)
+        let (memo, whole, in_comp, in_whole) = SCRATCH.with(|s| s.borrow_mut().pop()).unwrap_or_default();
+        Self::with_bufs(f, env, memo, whole, in_comp, in_whole)
     }
 
-    fn with_bufs(f: &'a Func, env: &'a mut E, mut memo: Vec<[Option<S>; 4]>, mut whole: Vec<Option<Value>>) -> Self {
+    fn with_bufs(
+        f: &'a Func,
+        env: &'a mut E,
+        mut memo: Vec<[Option<S>; 4]>,
+        mut whole: Vec<Option<Value>>,
+        mut in_comp: Vec<[bool; 4]>,
+        mut in_whole: Vec<bool>,
+    ) -> Self {
         memo.clear();
         memo.resize(f.ins.len(), [None; 4]);
         whole.clear();
         whole.resize(f.ins.len(), None);
+        in_comp.clear();
+        in_comp.resize(f.ins.len(), [false; 4]);
+        in_whole.clear();
+        in_whole.resize(f.ins.len(), false);
         // the untaken-branch rule holds for pixel processors too (scratch/pp2/sharedpp.py)
         let hoist_on = crate::env_once!("SDRT_NOHOIST").is_err();
-        Eval { f, memo, whole, vars: Vec::new(), vtab: None, vacc: 0, vdirty: false, env, hoist_on }
+        Eval { f, memo, whole, in_comp, in_whole, call_depth: 0, vars: Vec::new(), vtab: None, vacc: 0, vdirty: false, env, hoist_on }
     }
 
     pub fn run(f: &Func, env: &mut E) -> Value {
@@ -646,7 +671,7 @@ impl<'a, E: Env> Eval<'a, E> {
         }
         let mut bufs = bufs;
         let mut e = match bufs.as_deref_mut() {
-            Some(b) => Eval::with_bufs(f, env, std::mem::take(&mut b.0), std::mem::take(&mut b.1)),
+            Some(b) => Eval::with_bufs(f, env, std::mem::take(&mut b.0), std::mem::take(&mut b.1), std::mem::take(&mut b.2), std::mem::take(&mut b.3)),
             None => Eval::new(f, env),
         };
         e.vars = std::mem::take(vars);
@@ -665,12 +690,16 @@ impl<'a, E: Env> Eval<'a, E> {
         *vars = std::mem::take(&mut e.vars);
         let memo = std::mem::take(&mut e.memo);
         let whole = std::mem::take(&mut e.whole);
+        let in_comp = std::mem::take(&mut e.in_comp);
+        let in_whole = std::mem::take(&mut e.in_whole);
         match bufs {
             Some(b) => {
                 b.0 = memo;
                 b.1 = whole;
+                b.2 = in_comp;
+                b.3 = in_whole;
             }
-            None => SCRATCH.with(|s| s.borrow_mut().push((memo, whole))),
+            None => SCRATCH.with(|s| s.borrow_mut().push((memo, whole, in_comp, in_whole))),
         }
         v
     }
@@ -711,7 +740,9 @@ impl<'a, E: Env> Eval<'a, E> {
         };
         let memo = std::mem::take(&mut e.memo);
         let whole = std::mem::take(&mut e.whole);
-        SCRATCH.with(|s| s.borrow_mut().push((memo, whole)));
+        let in_comp = std::mem::take(&mut e.in_comp);
+        let in_whole = std::mem::take(&mut e.in_whole);
+        SCRATCH.with(|s| s.borrow_mut().push((memo, whole, in_comp, in_whole)));
         (v, captured)
     }
 
@@ -849,7 +880,23 @@ impl<'a, E: Env> Eval<'a, E> {
         if let Some(v) = self.memo[k][c] {
             return v;
         }
+        if self.call_depth >= 1024 {
+            // a dependency chain this deep would overflow the stack: fail the render
+            crate::cap_hit("vm comp depth");
+            panic!("function {}: expression nesting deeper than 1024 (malformed program?)", self.f.off);
+        }
+        if self.in_comp[k][c] {
+            crate::cap_hit("vm comp cycle");
+            return if is_int(self.f.ins[k].ty) { S::I(0) } else { S::F(0.0) };
+        }
+        self.in_comp[k][c] = true;
+        self.call_depth += 1;
+        if self.call_depth > 48 {
+            crate::depth_seen(self.call_depth);
+        }
         let v = self.compute(k, c);
+        self.call_depth -= 1;
+        self.in_comp[k][c] = false;
         self.memo[k][c] = Some(v);
         v
     }
@@ -862,7 +909,19 @@ impl<'a, E: Env> Eval<'a, E> {
         if let Some(v) = self.whole[k] {
             return v;
         }
+        if self.call_depth >= 1024 {
+            crate::cap_hit("vm whole depth");
+            panic!("function {}: expression nesting deeper than 1024 (malformed program?)", self.f.off);
+        }
+        if self.in_whole[k] {
+            crate::cap_hit("vm whole cycle");
+            return Value::Void;
+        }
+        self.in_whole[k] = true;
+        self.call_depth += 1;
         let v = self.value(k);
+        self.call_depth -= 1;
+        self.in_whole[k] = false;
         self.whole[k] = Some(v);
         v
     }
@@ -887,7 +946,7 @@ impl<'a, E: Env> Eval<'a, E> {
     fn compute(&mut self, k: usize, c: usize) -> S {
         let i = &self.f.ins[k];
         let ty = i.ty;
-        let op = |j: usize| i.ops[j] as usize;
+        let op = |j: usize| i.ops.get(j).copied().unwrap_or(0xFFFF) as usize;
         match i.op {
             // bool: one u16; without it the constant is true (scratch/pp2/boolc.py; multiwood node 24)
             0 if ty == 1 => S::B(i.ops.first().map_or(true, |&x| x != 0)),
@@ -896,19 +955,20 @@ impl<'a, E: Env> Eval<'a, E> {
                 let w = self.f.lits[k][c.min(comps(ty) - 1)];
                 if is_int(ty) { S::I(w as i32) } else { S::F(f32::from_bits(w)) }
             }
-            1 => typed(ty, comp_of(&self.env.sysvar(i.ops[0]), c)),
+            1 => typed(ty, comp_of(&self.env.sysvar(i.ops.first().copied().unwrap_or(0)), c)),
             2 => {
                 let uid = self.f.lits[k][0];
                 typed(ty, comp_of(&self.env.input(uid), c))
             }
-            3 => typed(ty, comp_of(&self.env.vp_value(i.ops[0] as usize), c)), // u16 node index
+            3 => typed(ty, comp_of(&self.env.vp_value(op(0)), c)), // u16 node index
             4 => {
                 // a variable is read whole at the first demand of any component: a later setvar of
                 // the same variable does not change this register (matches sbsrender on worn_rope)
                 if self.whole[k].is_none() {
-                    let v = self.var_read(i.ops[0], ty).unwrap_or(Value::F(4, [0.0; 4]));
-                    if crate::env_once!("SDRT_VARLOG").ok().and_then(|x| x.parse::<u16>().ok()).is_some_and(|j| j >= i.ops[0] && j < i.ops[0] + comps(ty) as u16) {
-                        eprintln!("varlog read var {} -> {:?} by fn {}", i.ops[0], v, self.f.off);
+                    let v0 = i.ops.first().copied().unwrap_or(0);
+                    let v = self.var_read(v0, ty).unwrap_or(Value::F(4, [0.0; 4]));
+                    if crate::env_once!("SDRT_VARLOG").ok().and_then(|x| x.parse::<u16>().ok()).is_some_and(|j| j >= v0 && j < v0 + comps(ty) as u16) {
+                        eprintln!("varlog read var {} -> {:?} by fn {}", v0, v, self.f.off);
                     }
                     self.whole[k] = Some(v);
                 }
@@ -924,7 +984,7 @@ impl<'a, E: Env> Eval<'a, E> {
             }
             7 => {
                 let x = self.comp(op(0), c);
-                self.set_var_comp(i.ops[1], ty, c, x);
+                self.set_var_comp(i.ops.get(1).copied().unwrap_or(0), ty, c, x);
                 x
             }
             9 => {
@@ -942,10 +1002,12 @@ impl<'a, E: Env> Eval<'a, E> {
                     let mut stack = if u < ins.len() { vec![(u, clamp_comp(ins, u, c))] } else { vec![] };
                     let mut found = vec![];
                     let mut reads = Vec::new();
+                    let mut seen = vec![[false; 4]; ins.len()];
                     while let Some((r, rc)) = stack.pop() {
-                        if found.contains(&(r, rc)) {
+                        if seen[r][rc] {
                             continue;
                         }
+                        seen[r][rc] = true;
                         if self.f.hoist[r][rc] {
                             // a shared setvar / write / loop there does not run (wood_base node 106)
                             if !matches!(ins[r].op, 6 | 7 | 11) {
@@ -966,7 +1028,11 @@ impl<'a, E: Env> Eval<'a, E> {
             11 => {
                 // loop: init, condition, body, max iterations (0: no limit); run once, whole values
                 if self.whole[k].is_none() {
-                    let max = Func::literal(&Ins { op: 0, ty: 0, ops: Ops::from(&i.ops[3..]) }, 0);
+                    let max = if i.ops.len() >= 4 {
+                        Func::literal(&Ins { op: 0, ty: 0, ops: Ops::from(&i.ops[3..]) }, 0)
+                    } else {
+                        0
+                    };
                     let (init, cond, body) = (op(0), op(1), op(2));
                     let mut last = self.whole_of(init);
                     let mut it = 0u32;
@@ -1021,7 +1087,7 @@ impl<'a, E: Env> Eval<'a, E> {
             }
             15 => typed(ty, self.comp(op(c.min(3)), 0)),
             16 => {
-                let sel = i.ops[1];
+                let sel = i.ops.get(1).copied().unwrap_or(0);
                 self.comp(op(0), ((sel >> (2 * c)) & 3) as usize)
             }
             17 => {
@@ -1151,7 +1217,7 @@ impl<'a, E: Env> Eval<'a, E> {
                 if self.whole[k].is_none() {
                     let px = self.comp(op(0), 0).f();
                     let py = self.comp(op(0), 1).f();
-                    let input = i.ops[1] as usize;
+                    let input = i.ops.get(1).copied().unwrap_or(0) as usize;
                     // no third operand: nearest (texel floor(pos·size)); 1: bilinear
                     // (scratch/pp2/samp2.py, 2026-10-28: the reverse of what was assumed before)
                     // the filter operand is a bit field: bit 0 bilinear (else nearest), bit 1 edges

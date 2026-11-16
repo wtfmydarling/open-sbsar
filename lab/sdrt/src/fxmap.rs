@@ -476,6 +476,8 @@ struct Ctx<'a> {
     /// past the budget everything stops and the node runs sequentially.
     spec: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     work: u64,
+    /// tree nodes visited by this context (runaway guard)
+    visits: u64,
     /// variable entries the snapshots may still hold; exhausted = the walk stops, sequential
     /// (metalplatessubstance002: a counter changed at every copy → one full snapshot per task, > 20 GB)
     snap_budget: usize,
@@ -669,6 +671,7 @@ impl<'a> Ctx<'a> {
             snap_budget: 0,
             spec: None,
             work: 0,
+            visits: 0,
             track: Some(Default::default()),
             call_depth: 0,
             split_at: u32::MAX,
@@ -723,6 +726,10 @@ impl<'a> Ctx<'a> {
                     o += 4;
                 }
                 let depth = st.depth + 1;
+        if depth >= 64 {
+            crate::cap_hit("fx depth");
+            return count;
+        }
                 if w & 0x10000 != 0 {
                     for k in 0..4 {
                         let child = p.w(o + 4 * k) as usize;
@@ -805,6 +812,17 @@ impl<'a> Ctx<'a> {
     }
 
     fn node(&mut self, off: usize, st: State) {
+        if st.depth >= 64 || self.call_depth >= 64 {
+            crate::cap_hit("fx node depth");
+            return;
+        }
+        // a runaway (malformed) tree fails the render; real trees stay far below this
+        // (castle_wall 805: 17M stamps)
+        self.visits += 1;
+        if self.visits > 1 << 28 {
+            crate::cap_hit("fx visits");
+            panic!("FX-Map: more than 2^28 tree nodes visited (malformed program?)");
+        }
         if self.gpu_collect && self.deferred.as_ref().is_some_and(|d| d.len() >= GPU_DRAW_LIMIT) {
             return;
         }
@@ -815,8 +833,8 @@ impl<'a> Ctx<'a> {
             if a.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
-            self.work += 1;
             let draws = self.deferred.as_ref().map_or(0, |d| d.len());
+            self.work += 1;
             if self.work > 50_000_000 || draws > 20_000_000 {
                 a.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
@@ -882,6 +900,7 @@ impl<'a> Ctx<'a> {
                 } else {
                     // the count fills the 24 bits above bit 8 (cartoon_slab node 1745: 250,000 = 500 × 500)
                     let mut count = w >> 8;
+                    
                     if w & 0x80 != 0 {
                         // the count function draws from its own stream: ITER_COUNT applied to the
                         // Iterate's seed (lab/py/itercount*.py)
@@ -1028,6 +1047,10 @@ impl<'a> Ctx<'a> {
             }
         }
         let depth = st.depth + 1;
+        if depth >= 64 {
+            crate::cap_hit("fx depth");
+            return;
+        }
         let (m, i) = CHILD[(depth as usize - 1).min(CHILD.len() - 1)];
         let q = 1.0 / (1u32 << depth) as f32 / 2.0;
         let mut kids = [0usize; 4];
@@ -1728,7 +1751,7 @@ fn render_inner(rt: &mut Runtime, n: &Node, seed: u32, gpu_collect: bool) -> Ren
     }
     let ngroups = kinds.len() + has_img as usize;
     let regroup = crate::env_once!("SDRT_FXORDER").as_deref() != Ok("trav") && (ngroups > 1 || dyn_img);
-    let mut ctx = Ctx { gpu_collect, deferred: if regroup || gpu_collect { Some(vec![]) } else { None }, collect: None, snaps: vec![], snap_budget: 0, spec: None, work: 0, track: None, call_depth: 0, split_at: u32::MAX, no_snap: crate::env_once!("SDRT_SNAP").is_err() && crate::env_once!("SDRT_SNAPLX").is_err() && crate::env_once!("SDRT_FXWRAPC").is_err(), rt: rtr, p: rtr.p, out, color: n.color, quantized_color, quantized_gray, max_depth: md, hurst, opmult, roi, wrap: (n.b3 & 1 != 0, n.b3 & 2 != 0), inputs: std::sync::Arc::new(inputs), input_formats, funcs: Default::default(), weights: vec![], bufs: Default::default(), vars: std::cell::RefCell::new(rtr.node_vars.clone()), unsupported: vec![] };
+    let mut ctx = Ctx { gpu_collect, deferred: if regroup || gpu_collect { Some(vec![]) } else { None }, collect: None, snaps: vec![], snap_budget: 0, spec: None, work: 0, visits: 0, track: None, call_depth: 0, split_at: u32::MAX, no_snap: crate::env_once!("SDRT_SNAP").is_err() && crate::env_once!("SDRT_SNAPLX").is_err() && crate::env_once!("SDRT_FXWRAPC").is_err(), rt: rtr, p: rtr.p, out, color: n.color, quantized_color, quantized_gray, max_depth: md, hurst, opmult, roi, wrap: (n.b3 & 1 != 0, n.b3 & 2 != 0), inputs: std::sync::Arc::new(inputs), input_formats, funcs: Default::default(), weights: vec![], bufs: Default::default(), vars: std::cell::RefCell::new(rtr.node_vars.clone()), unsupported: vec![] };
     ctx.weights = (0..64).map(|d| ctx.weight_calc(d)).collect();
     let root = State { depth: 0, center: [0.5, 0.5], seed: seed & M24, branch: [0.0, 0.0], number: 0.0 };
     if gpu_collect && ctx.estimate_draws(n.data, root, GPU_DRAW_LIMIT) >= GPU_DRAW_LIMIT {

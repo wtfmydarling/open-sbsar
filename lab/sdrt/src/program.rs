@@ -46,7 +46,7 @@ impl Node {
         (self.b2 >> 4) & 3
     }
     pub fn size(&self) -> (usize, usize) {
-        (1 << self.log2.0, 1 << self.log2.1)
+        (1 << self.log2.0.min(13), 1 << self.log2.1.min(13))
     }
 }
 
@@ -82,17 +82,23 @@ fn words_of_type(t: u32, version: u32) -> usize {
 impl Program {
     pub fn w(&self, off: usize) -> u32 {
         let o = self.base + off;
-        u32::from_le_bytes(self.b[o..o + 4].try_into().unwrap())
+        if o + 4 <= self.b.len() {
+            u32::from_le_bytes(self.b[o..o + 4].try_into().unwrap())
+        } else {
+            0
+        }
     }
     pub fn f(&self, off: usize) -> f32 {
         f32::from_bits(self.w(off))
     }
     pub fn bytes(&self, off: usize, n: usize) -> &[u8] {
-        &self.b[self.base + off..self.base + off + n]
+        let start = (self.base + off).min(self.b.len());
+        let end = (start + n).min(self.b.len());
+        &self.b[start..end]
     }
 
     pub fn parse(b: Vec<u8>) -> Result<Program, String> {
-        let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let u = |o: usize| if o + 4 <= b.len() { u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) } else { 0 };
         if b.len() < 0x40 || &b[..4] != b"SBAM" {
             return Err("not an .sbsasm".into());
         }
@@ -101,13 +107,28 @@ impl Program {
         let p = u(0x2c) as usize;
         let base = 0x34;
         let iface = base + p;
+        if iface + 4 > b.len() {
+            return Err("truncated interface".into());
+        }
         let n_out = u16::from_le_bytes([b[iface], b[iface + 1]]) as usize;
         let n_in = u16::from_le_bytes([b[iface + 2], b[iface + 3]]) as usize;
+        if n_out > 10_000 || n_in > 10_000 || iface + 4 + 4 * n_out > b.len() {
+            return Err("invalid io count".into());
+        }
         let uids: Vec<u32> = (0..n_out).map(|k| u(iface + 4 + 4 * k)).collect();
         let io = iface + 4 + 4 * n_out;
+        if io + 8 * n_in > b.len() {
+            return Err("truncated inputs".into());
+        }
         let inputs: Vec<(u32, u32)> = (0..n_in).map(|k| (u(io + 8 * k), u(io + 8 * k + 4))).collect();
         let tr = io + 8 * n_in;
+        if tr + 16 > b.len() {
+            return Err("truncated table roots".into());
+        }
         let (n_nodes, node_table, out_table, defaults) = (u(tr) as usize, u(tr + 4) as usize, u(tr + 8) as usize, u(tr + 12) as usize);
+        if n_nodes > b.len() / 4 {
+            return Err("node count larger than the program".into());
+        }
         let mut prog = Program { b, base, version, build, nodes: vec![], outputs: vec![], inputs, defaults: HashMap::new() };
         prog.outputs = (0..n_out)
             .map(|k| Output { uid: uids[k], flags: prog.w(out_table + 8 * k), node: prog.w(out_table + 8 * k + 4) as usize })
@@ -149,6 +170,8 @@ impl Cur<'_> {
         v
     }
     fn words(&mut self, n: usize) -> Vec<u32> {
+        // words past the end read as 0; a count beyond the program is malformed
+        let n = n.min(self.p.b.len() / 4);
         (0..n).map(|_| self.word()).collect()
     }
     fn slot(&mut self, bits: u32, n: usize) -> Slot {
@@ -205,7 +228,7 @@ fn parse_node(p: &Program, index: usize, off: usize) -> Result<Node, String> {
         0x00 => {
             // gradient map
             n.inputs.push(c.word() as usize);
-            n.count = c.word();
+            n.count = c.word().min(p.b.len() as u32 / 4);
             if p.version >= 8 && b3 & 2 != 0 {
                 n.params.push(("v8word", Slot::Const(vec![c.word()])));
             }
@@ -427,7 +450,7 @@ fn parse_node(p: &Program, index: usize, off: usize) -> Result<Node, String> {
         }
         0x2C => {
             n.inputs.push(c.word() as usize);
-            n.count = c.word();
+            n.count = c.word().min(p.b.len() as u32 / 4);
             n.data = c.word() as usize;
             common!();
         }

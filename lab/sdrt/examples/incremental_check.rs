@@ -2,7 +2,7 @@
 //! return the same bytes as a full `Renderer::render` with the same parameters.
 //!
 //! cargo run --release --example incremental_check -- [cpu|gpu] LOG2SIZE FILE.sbsar...
-//! Exit code 1 on any mismatch.
+//! Exit code 1 on any non-MATCH/non-SKIPPED outcome.
 use open_sbsar::{Graph, InputKind, Instance, Package, Parameters, Renderer, Value};
 use std::time::Instant;
 
@@ -61,16 +61,39 @@ fn changes(graph: &Graph, size: i32) -> Vec<(String, Value)> {
     out
 }
 
+#[derive(Default)]
+struct Counts {
+    matched: usize,
+    mismatch: usize,
+    both_error: usize,
+    inc_error: usize,
+    full_error: usize,
+    skipped: usize,
+}
+
+impl Counts {
+    fn failed(&self) -> bool {
+        self.mismatch + self.both_error + self.inc_error + self.full_error > 0
+    }
+    fn print_summary(&self, backend: &str) {
+        println!(
+            "{backend} summary: MATCH={} MISMATCH={} BOTH-ERROR={} INC-ERROR={} FULL-ERROR={} SKIPPED={}",
+            self.matched, self.mismatch, self.both_error, self.inc_error, self.full_error, self.skipped
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let gpu = args[0] == "gpu";
     let size: i32 = args[1].parse().expect("LOG2SIZE");
-    let (mut bad, mut steps) = (0, 0);
+    let mut counts = Counts::default();
     for path in &args[2..] {
         let package = match Package::open(path) {
             Ok(p) => p,
             Err(e) => {
-                println!("{path}: cannot open: {e}");
+                println!("SKIPPED {path}: cannot open: {e}");
+                counts.skipped += 1;
                 continue;
             }
         };
@@ -84,7 +107,8 @@ fn main() {
         let mut params = Parameters::new();
         params.set("$outputsize", Value::Int(vec![size, size]));
         if let Err(e) = inst.render(&mut inc_r, graph, &params, None) {
-            println!("{path}: render failed: {e}");
+            println!("SKIPPED {path}: initial render failed: {e}");
+            counts.skipped += 1;
             continue;
         }
         let first = inst.last_stats();
@@ -99,23 +123,44 @@ fn main() {
             let t = Instant::now();
             let b = full_r.render(graph, &params, None);
             let tf = t.elapsed().as_secs_f64();
-            steps += 1;
-            let same = match (&a, &b) {
-                (Ok(a), Ok(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.identifier == y.identifier && x.width == y.width && x.height == y.height && x.data == y.data),
-                (Err(x), Err(y)) => x.0 == y.0,
-                _ => false,
-            };
-            if !same {
-                bad += 1;
-                match (&a, &b) {
-                    (Err(e), _) => println!("  incremental render failed: {e}"),
-                    (_, Err(e)) => println!("  full render failed: {e}"),
-                    _ => println!("  outputs differ"),
+            let tag = match (&a, &b) {
+                (Ok(a), Ok(b)) => {
+                    let eq = a.len() == b.len()
+                        && a.iter().zip(b).all(|(x, y)| {
+                            x.identifier == y.identifier
+                                && x.width == y.width
+                                && x.height == y.height
+                                && x.format == y.format
+                                && x.data == y.data
+                        });
+                    if eq {
+                        counts.matched += 1;
+                        "MATCH     "
+                    } else {
+                        counts.mismatch += 1;
+                        println!("  outputs differ");
+                        "MISMATCH  "
+                    }
                 }
-            }
-            println!("  {} {id} = {v:?}: recomputed {} reused {} | incremental {ti:.3} s, full {tf:.3} s", if same { "ok      " } else { "MISMATCH" }, st.recomputed, st.reused);
+                (Err(ei), Err(ef)) => {
+                    counts.both_error += 1;
+                    println!("  both failed: inc={ei} | full={ef}");
+                    "BOTH-ERROR"
+                }
+                (Err(ei), Ok(_)) => {
+                    counts.inc_error += 1;
+                    println!("  incremental render failed: {ei}");
+                    "INC-ERROR "
+                }
+                (Ok(_), Err(ef)) => {
+                    counts.full_error += 1;
+                    println!("  full render failed: {ef}");
+                    "FULL-ERROR"
+                }
+            };
+            println!("  {tag} {id} = {v:?}: recomputed {} reused {} | incremental {ti:.3} s, full {tf:.3} s", st.recomputed, st.reused);
         }
     }
-    println!("{} backend: {steps} steps, {bad} mismatches", if gpu { "gpu" } else { "cpu" });
-    std::process::exit(if bad > 0 { 1 } else { 0 });
+    counts.print_summary(if gpu { "gpu" } else { "cpu" });
+    std::process::exit(if counts.failed() { 1 } else { 0 });
 }
