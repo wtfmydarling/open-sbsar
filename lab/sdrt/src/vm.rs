@@ -1233,7 +1233,12 @@ impl<'a, E: Env> Eval<'a, E> {
                 let v = self.whole[k].unwrap();
                 comp_of(&v, c)
             }
-            _ => S::F(0.0),
+            _ => {
+                if crate::envc::var("SDRT_CAPLOG").is_ok() {
+                    crate::cap_hit(&format!("vm unknown op {}", i.op));
+                }
+                S::F(0.0)
+            }
         }
     }
 }

@@ -66,6 +66,10 @@ required-features = ["gpu"]
 name = "incr_scenarios"
 required-features = ["gpu"]
 
+[[example]]
+name = "leak_check"
+required-features = ["gpu"]
+
 [dependencies.wgpu]
 version = "30"
 optional = true

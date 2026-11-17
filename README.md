@@ -18,8 +18,10 @@ Version 0.1: usable, under active development.
   less than 0.02 and 14.4% by more (usually a few pixels: by eye, most of them cannot be told
   apart from Substance's output). Most remaining differences are floating-point noise that
   Substance's own CPU and GPU engines also disagree on, amplified by threshold chains.
-- **Every node type** of the format is implemented: the library renders all 1,388 files of the
-  Substance community library.
+- **Every node type** of the format is implemented: every node and function instruction in all 1,388
+  files of the Substance community library is understood (`examples/scan_ops.rs`); 1,372 of
+  them were rendered in the last full check, the other 16 need more than a 12 GB GPU and were
+  not run to the end on the CPU.
 - **GPU**: about 95% of the nodes of real graphs run on the GPU, bit-exact with the CPU path
   (except pixel-processor transcendentals and levels' gamma, which use the GPU's own functions,
   as Substance's GPU engine does). Validated on an NVIDIA RTX 4070 SUPER (Vulkan). A material at
@@ -28,9 +30,9 @@ Version 0.1: usable, under active development.
   images with `Parameters::set_image` (CLI: `--set-image IDENT=path`).
 - **Pure Rust**: the `.sbsar` archive is read by the crate's own 7z reader; no external tools.
 - **Not yet**: WebAssembly/WebGPU.
-- **Known limits**: 16 of the 1,388 library files need more GPU memory than a 12 GB card has
+- **Known limits**: 17 of the 1,388 library files need more GPU memory than a 12 GB card has
   (some of their nodes have fixed sizes up to 8192²); the GPU render then returns an error, and
-  the CPU path renders them, slowly (minutes). Malformed archives and programs return errors instead of
+  the CPU path can render them, slowly (one took 7 minutes at 128²). Malformed archives and programs return errors instead of
   crashing (fuzz-tested), but a hostile file can still make a render take minutes or several GB
   (as large valid files do): run untrusted files with a time and memory limit.
 
