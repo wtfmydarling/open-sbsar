@@ -28,6 +28,11 @@ Version 0.1: usable, under active development.
   images with `Parameters::set_image` (CLI: `--set-image IDENT=path`).
 - **Pure Rust**: the `.sbsar` archive is read by the crate's own 7z reader; no external tools.
 - **Not yet**: WebAssembly/WebGPU.
+- **Known limits**: 16 of the 1,388 library files need more GPU memory than a 12 GB card has
+  (some of their nodes have fixed sizes up to 8192²); the GPU render then returns an error, and
+  the CPU path renders them, slowly (minutes). Malformed archives and programs return errors instead of
+  crashing (fuzz-tested), but a hostile file can still make a render take minutes or several GB
+  (as large valid files do): run untrusted files with a time and memory limit.
 
 ## Library
 
