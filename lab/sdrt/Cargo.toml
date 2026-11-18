@@ -16,7 +16,7 @@ name = "open_sbsar"
 path = "src/lib.rs"
 
 [[bin]]
-name = "sdrt"
+name = "open-sbsar"
 path = "src/main.rs"
 
 [workspace]

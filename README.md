@@ -88,11 +88,11 @@ for out in renderer.render(graph, &params, None)? {         // None: every image
 ## Command-line tool
 
 ```sh
-cargo build --release --manifest-path lab/sdrt/Cargo.toml   # target/release/sdrt
-sdrt render FILE.sbsar OUTDIR            # every output as a 16-bit PNG named after its identifier
-sdrt inputs FILE.sbsar                   # the graph's parameters
-sdrt node FILE.sbsar INDEX OUT.png       # one internal node (OUT.f32: raw RGBA f32)
-sdrt stats FILE.sbsar                    # every node: op, size, value ranges
+cargo build --release --manifest-path lab/sdrt/Cargo.toml   # target/release/open-sbsar
+open-sbsar render FILE.sbsar OUTDIR            # every output as a 16-bit PNG named after its identifier
+open-sbsar inputs FILE.sbsar                   # the graph's parameters
+open-sbsar node FILE.sbsar INDEX OUT.png       # one internal node (OUT.f32: raw RGBA f32)
+open-sbsar stats FILE.sbsar                    # every node: op, size, value ranges
     --set '$outputsize=10,10'            # set a parameter (log2 sizes here: 1024²)
     --set-image IDENT=image.png          # connect an image input (PNG, JPEG, TIFF, EXR)
     --backend vulkan                     # the GPU path (the default is the CPU path)
