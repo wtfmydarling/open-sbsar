@@ -113,6 +113,16 @@ renderer and compared the images pixel by pixel with our engine, then refined th
 they matched. No decompilation, disassembly, shader or API capture, and no reading of the vendor's
 binaries or resources was used at any point.
 
+## Compatibility & Accuracy
+![Accuracy Example](AccuracyExample.png)
+
+Based on the rendering results for all 1,388 files, 72% of outputs are identical to the original Substance engine (all pixels match bit-for-bit), while the rest show some discrepancies. For example, in the image above (yes, this isn't just a meme), a comparison with the original yields the following values: 
+- SSIM: 0.9889
+- Identical pixels: 28.2369%
+- Different pixels: 71.7631%
+- Mean absolute RGB error: 1.2059 / 255
+The non-identical outputs have an average SSIM of 0.995506. There is still room for improvement, but the engine already achieves a high level of accuracy compared to the original Substance engine.
+
 ## Support
 
 This project is independently developed and funded by a student. If you find it useful, consider
