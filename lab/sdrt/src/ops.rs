@@ -3984,7 +3984,7 @@ impl<'p> Runtime<'p> {
         let wrap = (true, true);
         let rt: &Runtime = self;
         // registers that are the same at every pixel: computed at the first pixel, then reused
-        let inv = f.pixel_invariant();
+        let inv = if crate::envc::var("SDRT_NOPREFILL").is_ok() { vec![false; f.ins.len()] } else { f.pixel_invariant() };
         let prefill = {
             let pos = [0.5 / w as f32, 0.5 / h as f32];
             let mut env = PixEnv { rt, size: [w as f32, h as f32], srcs: &refs, fmts: &fmts, wrap, pos, state: pixel_seed(seed, pos), written: None, filter: 0 };
@@ -3999,6 +3999,7 @@ impl<'p> Runtime<'p> {
                         let pos = [(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32];
                         let mut env = PixEnv { rt, size: [w as f32, h as f32], srcs: &refs, fmts: &fmts, wrap, pos, state: pixel_seed(seed, pos), written: None, filter: 0 };
                         let v = Eval::run_prefilled(&f, &mut env, &mut node_vars.clone(), &prefill);
+                        if (x, y) == (w / 2, h / 2) && crate::envc::var("SDRT_PPDBG").is_ok_and(|v| v == n.index.to_string()) { eprintln!("ppdbg node {} vars {:?} center {:?}", n.index, node_vars, v); }
                         let c = v.fv();
                         if n.color {
                             if v.n() >= 4 { c } else if v.n() == 3 { [c[0], c[1], c[2], 1.0] } else { [c[0], c[0], c[0], 1.0] }

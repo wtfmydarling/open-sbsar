@@ -502,6 +502,21 @@ pub fn sbs_sin(t: f32) -> f32 {
     sbs_sin_turns(t * (1.0 / std::f32::consts::TAU))
 }
 
+/// log2 as the GPU computes it in pixel processors: of an exact power of two below 1 it returns
+/// the float next to the integer, toward zero (RTX 4070 SUPER, Vulkan: log2(2^-k) = -k + 1 ulp
+/// for k = 1..8, exact for 2^k, k >= 0; scratch/log2probe.wgsl). A ceil() of it then rounds up:
+/// ceramic_01's height-pyramid atlas (node 2777) samples its 1x1 level at the last row only so,
+/// as Substance's GPU engine does. Other inputs: the CPU's log2 (the GPU's differs from it by
+/// about 1e-7, noise accepted elsewhere too).
+pub fn gpu_log2(x: f32) -> f32 {
+    let l = x.log2();
+    if x > 0.0 && x < 1.0 && x.is_normal() && x.to_bits() & 0x007F_FFFF == 0 {
+        f32::from_bits(l.to_bits() - 1)
+    } else {
+        l
+    }
+}
+
 pub fn sbs_cos(t: f32) -> f32 {
     sbs_trig_turns(t * (1.0 / std::f32::consts::TAU), 0.5)
 }
@@ -1182,7 +1197,7 @@ impl<'a, E: Env> Eval<'a, E> {
                     43 => f32::exp2,
                     44 => f32::tan,
                     _ if cpu => |x| if x <= 0.0 { 0.0 } else { x.log2() },
-                    _ => f32::log2,
+                    _ => gpu_log2,
                 };
                 typed(ty, S::F(f(a.f())))
             }
