@@ -77,7 +77,14 @@ pub fn input_uids(xml: &str) -> Vec<(String, u32)> {
 pub fn string_defaults(xml: &str) -> Vec<(u32, String)> {
     let mut v = vec![];
     for part in xml.split("<input ").skip(1) {
-        let head = format!(" {}", part.split('>').next().unwrap_or("")).replace(['\n', '\t', '\r'], " ");
+        // whitespace between attributes becomes spaces; inside a quoted value it is kept (a
+        // multi-line text default: clothes_care_label's labels break lines with raw newlines,
+        // which Substance keeps, unlike XML attribute normalization)
+        let mut quoted = false;
+        let head: String = std::iter::once(' ').chain(part.split('>').next().unwrap_or("").chars().map(|c| {
+            if c == '"' { quoted = !quoted; }
+            if !quoted && matches!(c, '\n' | '\t' | '\r') { ' ' } else { c }
+        })).collect();
         let attr = |name: &str| head.split(&format!(" {name}=\"")).nth(1).and_then(|s| s.split('"').next()).map(str::to_string);
         if attr("type").as_deref() != Some("6") {
             continue;
