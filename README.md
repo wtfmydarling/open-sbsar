@@ -19,9 +19,8 @@ Version 0.1: usable, under active development.
   apart from Substance's output). Most remaining differences are floating-point noise that
   Substance's own CPU and GPU engines also disagree on, amplified by threshold chains.
 - **Every node type** of the format is implemented: every node and function instruction in all 1,388
-  files of the Substance community library is understood (`examples/scan_ops.rs`); 1,372 of
-  them were rendered in the last full check, the other 16 need more than a 12 GB GPU and were
-  not run to the end on the CPU.
+  files of the Substance community library is understood (`examples/scan_ops.rs`); all 1,388 of
+  them were rendered in the last full check.
 - **GPU**: about 95% of the nodes of real graphs run on the GPU, bit-exact with the CPU path
   (except pixel-processor transcendentals and levels' gamma, which use the GPU's own functions,
   as Substance's GPU engine does). Validated on an NVIDIA RTX 4070 SUPER (Vulkan). A material at
