@@ -121,6 +121,7 @@ Based on the rendering results for all 1,388 files, 72% of outputs are identical
 - Identical pixels: 28.2369%
 - Different pixels: 71.7631%
 - Mean absolute RGB error: 1.2059 / 255
+- 
 The non-identical outputs have an average SSIM of 0.995506. There is still room for improvement, but the engine already achieves a high level of accuracy compared to the original Substance engine.
 
 ## Support
